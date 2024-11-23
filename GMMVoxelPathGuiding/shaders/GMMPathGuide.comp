@@ -1,0 +1,1396 @@
+#version 450
+
+//常量
+const float PI = 3.1415926535f;
+const float a = 2.01f;	//协差阵的先验样本数
+const float b = 0.1f;	//0.0005f;	//协差阵的先验方差
+const float v = 1.01f;	//混合权重项的先验样本数
+const uint K = 4;	//高斯分布的数量
+const float alpha = 0.7f;
+const uint m = 5;
+const float getPhotonRange = 0.05f;
+const uint gmmPerVoxel = 1;
+
+//struct
+//现在就一个pos，但是以后需要采样texture时或者别的时候可以再加
+struct Vertex {
+	vec4 pos;
+	vec4 normal;
+};
+
+float lightA = 25.0f;
+float sqrtLightA = 5.0f;
+vec3 lightStrength = vec3(27.0f, 22.0f, 14.0f);
+
+struct AABBBox {
+	float leftX;
+	float rightX;
+	float leftY;
+	float rightY;
+	float leftZ;
+	float rightZ;
+};
+
+struct BvhArrayNode {
+	int leftNodeIndex;
+	int rightNodeIndex;
+	AABBBox AABB;
+	int meshIndex;
+};
+
+struct Material {
+	//bxdfPara.x表示roughness，y表示metallic，z表示refractivity，若z = 1表示不考虑折射
+	vec4 bxdfPara;
+	vec4 kd;
+	vec4 ks;
+	vec4 ke;
+};
+
+struct Mesh {
+	Material material;
+	ivec2 indexInIndicesArray;
+	AABBBox AABB;
+};
+
+struct Ray{
+	vec3 startPos;
+	vec3 direction;
+	vec3 normal;	//这个主要是记录上一个着色点的法线
+	vec3 radiance;
+	float depth;
+};
+
+struct GaussianPara {
+	vec2 mean;
+	float mixWeight;
+	mat2 covarianceMatrix;
+};
+
+struct Sufficient_Statistic {
+	vec2 ss2;	//高斯分布对该样本的贡献比例乘以样本的位置的乘积之和
+	float ss1;		//高斯分布对每个样本的贡献比例之和
+	mat2 ss3;	//样本的位置向量与其转置的乘积乘以高斯分布对该样本的贡献比例的乘积之和
+};
+
+struct Photon {
+	vec2 direction;	//将三维方向转为2维方向，同心圆映射
+	float weight;	//亮度 = 0.299f * R + 0.587f * G + 0.114f * B
+	vec4 direction_3D;
+	vec4 normal;
+	vec4 hitPos;
+	vec4 startPos;
+};
+
+struct PhotonTracingResult{
+	uint photonNum;
+	Photon photons[10];
+};
+
+struct GMMPara {
+	float r;	//有效半径
+	float photonAvgWeight;
+	float photonAvgDistance;
+	uint photonNum;
+	uint lastUse;	//上次被使用是几帧前
+	vec4 pos;
+	vec4 normal;
+	GaussianPara gaussianParas[K];
+	Sufficient_Statistic SSs[K];
+};
+
+layout(set = 0, binding = 0) uniform LightUniformBufferObject {
+	mat4 model;
+	mat4 view;
+	mat4 proj;
+	vec4 lightPos;
+	vec4 normal;
+	vec4 size;
+} lubo;
+
+layout(set = 1, binding = 0) uniform cameraUniformBufferObject {
+	mat4 model;
+	mat4 view;
+	mat4 proj;
+	vec4 cameraPos;
+	vec4 randomNumber;	//xyz是随机数，而w是帧数
+} cubo;
+
+layout(set = 2, binding = 0, std430) readonly buffer BvhArray{
+	BvhArrayNode bvhArrayNode[];
+};
+layout(set = 2, binding = 1, std430) readonly buffer Vertices{
+	Vertex vertices[]; 
+};
+layout(set = 2, binding = 2, std430) readonly buffer Indices{
+	uint indices[]; 
+};
+layout(set = 2, binding = 3, std430) readonly buffer Meshs{
+	Mesh meshs[]; 
+};
+
+layout(set = 2, binding = 4) uniform sampler2D shadowMap;
+layout(set = 2, binding = 5, rgba8) uniform writeonly image2D pathTracingResult;
+
+layout(set = 2, binding = 6) uniform GMMConstant {
+	vec4 voxelStartPos;
+	ivec4 voxelNum;
+	float voxelSize;
+	uint photonTracingNum;
+} gmmConstant;
+
+layout(set = 2, binding = 7, std430) buffer PhotonTracingResults{
+	PhotonTracingResult photonTracingResults[];
+};
+
+layout(set = 2, binding = 8, std430) buffer GMMParaBuffer{
+	GMMPara gmmParas[];
+};
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+//function
+
+//----------------------------randomNumber-------------------------------------------
+
+uint pcg(inout uint state)
+{
+    uint prev = state * 747796405u + 2891336453u;
+    uint word = ((prev >> ((prev >> 28u) + 4u)) ^ prev) * 277803737u;
+    state = prev;
+    return (word >> 22u) ^ word;
+}
+
+uvec2 pcg2d(uvec2 v)
+{
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * 1664525u;
+    v.y += v.x * 1664525u;
+    v = v ^ (v >> 16u);
+    v.x += v.y * 1664525u;
+    v.y += v.x * 1664525u;
+    v = v ^ (v >> 16u);
+    return v;
+}
+
+float rand(inout uint seed)
+{
+    uint val = pcg(seed);
+    return (float(val) * (1.0 / float(0xffffffffu)));
+}
+
+
+//低差异序列
+float RadicalInverse_VdC(uint bits) 
+{
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10; // / 0x100000000
+}
+vec2 Hammersley(uint i, uint N)
+{
+    return vec2(float(i)/float(N), RadicalInverse_VdC(i));
+}
+
+//----------------------------createRay------------------------------------------
+//创造起始光线
+Ray makeStartRayFromCamera(vec2 texelUV){
+
+	vec4 ndcPos = vec4(texelUV * 2.0f - 1.0f, 0.0f, 1.0f);
+	vec4 worldPos = inverse(cubo.proj * cubo.view) * ndcPos;
+	Ray ray;
+	ray.startPos = cubo.cameraPos.xyz;
+	ray.direction = normalize((worldPos.xyz / worldPos.w) - ray.startPos);	//得到的worldPos是近平面的一点
+	ray.normal = ray.direction;//normalize(transpose(mat3(cubo.view)) * vec3(0.0f, 0.0f, -1.0f));	//逆矩阵的转置的逆 = 转置 
+	ray.depth = 100.0f;	//远平面
+
+	return ray;
+
+}
+
+//创造起始光子
+Ray makeStartPhoton(inout uint randomNumberSeed, inout float pdf){
+
+	Ray ray;
+	//vec2 randomNumber = Hammersley(uint(rand(randomNumberSeed) * 100), 100) * 0.5f + rand(randomNumberSeed) * 0.5f;
+	//ray.startPos = lubo.lightPos.xyz + lubo.size.xyz * vec3(randomNumber.x, rand(randomNumberSeed), randomNumber.y);
+	ray.startPos = lubo.lightPos.xyz + lubo.size.xyz * vec3(rand(randomNumberSeed), rand(randomNumberSeed), rand(randomNumberSeed));
+	ray.normal = lubo.normal.xyz;
+
+	//cos加权
+	randomNumberSeed++;
+	vec2 randomNumberH = vec2(rand(randomNumberSeed), rand(randomNumberSeed));
+	float phi = 2.0 * PI * randomNumberH.x;
+	float cosTheta = randomNumberH.y;	//sqrt(1.0 - randomNumberH.y) 1减后还是均匀分布，开平方后还是均匀分布，所以可以直接用
+	float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+	ray.direction = normalize(vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta));
+
+	vec3 tangent;
+	if(abs(ray.normal.x) > abs(ray.normal.y))
+        tangent = vec3(ray.normal.z, 0, -ray.normal.x);
+    else
+        tangent = vec3(0, -ray.normal.z, ray.normal.y);
+	tangent = normalize(tangent);
+    vec3 bitangent = normalize(cross(ray.normal, tangent));
+	mat3 TBN = mat3(tangent, bitangent, ray.normal);
+
+	ray.direction = normalize(TBN * ray.direction);
+	ray.depth = 100.0f;
+	ray.radiance = lightStrength / lightA;
+
+	pdf = cosTheta / PI;
+
+	return ray;
+
+}
+
+//--------------------------------------------------------------------------
+
+vec2 concentricMapping_hemisphere_3DTo2D(vec3 direction, mat3 TBN){
+
+	/*
+	//先把3维方向变为天顶角和方位角，同心圆映射到时候再搞
+	direction = transpose(TBN) * direction;	//返回切线空间
+	float cosTheta = direction.z;
+	float theta = acos(cosTheta);
+	float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+	return sinTheta != 0.0f ? vec2(theta, acos(direction.x / sinTheta)) : vec2(theta, 0.0f);
+	*/
+
+	direction = transpose(TBN) * direction;	//返回切线空间
+	float x = max(abs(direction.x), abs(direction.y));
+	float y = min(abs(direction.x), abs(direction.y));
+	float r = sqrt(1.0f - direction.z);
+
+	float alphia = x == 0.0f ? 0.0f : y / x;
+	float phi_2DivPI = (0.00000406531 + 0.636227 * alpha +  
+            0.00615523 * alpha * alpha -
+            0.247326 * alpha * alpha * alpha +
+            0.0881627 * alpha * alpha * alpha * alpha +
+            0.0419157 * alpha * alpha * alpha * alpha * alpha -
+            0.0251427 * alpha * alpha * alpha * alpha * alpha * alpha);
+	
+	float u = r;
+	float v = 2.0f * phi_2DivPI * u;
+	if(abs(direction.x) < abs(direction.y)){
+		float temp = u;
+		u = v;
+		v = temp;
+	}
+
+	u *= sign(direction.x);
+	v *= sign(direction.y);
+
+	return vec2(u, v) * 0.5f + 0.5f;
+
+}
+
+vec3 concentricMapping_hemisphere_2DTo3D(vec2 direction, mat3 TBN){
+
+/*
+	float x = sin(direction.x) * cos(direction.y);
+	float y = sin(direction.x) * sin(direction.y);
+	float z = cos(direction.x);
+
+	return normalize(TBN * vec3(x, y, z));
+*/
+	
+	direction = direction * 2.0f - 1.0f;
+	float u = max(abs(direction.x), abs(direction.y));
+	float v = min(abs(direction.x), abs(direction.y));
+
+	float r = u;
+	float phi = PI / 4 * v / u;
+
+	float x = cos(phi) * r * sqrt(2.0f - r * r);
+	float y = sin(phi) * r * sqrt(2.0f - r * r);
+	float z = 1.0f - r * r;
+
+	if(abs(direction.x) < abs(direction.y)){
+		float temp = x;
+		x = y;
+		y = temp;
+	}
+
+	x *= sign(direction.x);
+	y *= sign(direction.y);
+
+	return normalize(TBN * vec3(x, y ,z));
+
+}
+
+void getHitPointNormalAndTBN(uint vertexIndex, inout vec3 normal, inout mat3 TBN){
+
+	//计算面法线
+	vec3 P0 = vertices[vertexIndex].pos.xyz;
+	vec3 P1 = vertices[vertexIndex + 1].pos.xyz;
+	vec3 P2 = vertices[vertexIndex + 2].pos.xyz;
+	
+	vec3 tangent = normalize(P1 - P0);
+	vec3 bitangent = normalize(P2 - P0);
+	normal = normalize(cross(tangent, bitangent));
+	bitangent = normalize(cross(normal, tangent));
+	TBN = mat3(tangent, bitangent, normal);
+	
+}
+
+//---------------------------------------------EM---------------------------------------
+//二元高斯分布
+float GaussianPdf(GaussianPara gp, vec2 pos){
+
+	float x = pos.x;
+	float y = pos.y;
+	float mu1 = gp.mean.x;	//均值
+	float mu2 = gp.mean.y;
+	float d1 = sqrt(gp.covarianceMatrix[0].x);	//标准差
+	float d2 = sqrt(gp.covarianceMatrix[1].y);
+	float d3 = gp.covarianceMatrix[0].y;	//协方差
+	float rho = d3 / d1 / d2;	//相关系数
+	float pdf = 1 / (2 * PI * d1 * d2 * sqrt(1 - rho * rho)) * exp(-0.5f / (1 - rho * rho) * ((x - mu1) * (x - mu1) / d1 / d1 - 2 * rho * (x - mu1) / d1 * (y - mu2) / d2 + (y - mu2) * (y - mu2) / d2 / d2));
+	
+	return pdf;
+
+}
+
+void E_Step(inout GMMPara gmmPara, Photon photon, uint photonNum){
+
+	float coff = pow(photonNum, -alpha);
+	gmmPara.photonAvgWeight = (1 - coff) * gmmPara.photonAvgWeight + coff * photon.weight;
+	float gamma[K];
+	float gammaSum = 0.0f;
+
+	for(int i = 0; i < K; i++){
+		GaussianPara gp = gmmPara.gaussianParas[i];
+		gamma[i] = GaussianPdf(gp, photon.direction);
+		gammaSum += gamma[i];
+	}
+
+	gammaSum = gammaSum == 0.0f ? 1.0f : gammaSum;
+
+	for(int i = 0; i < K; i++){
+		Sufficient_Statistic SS = gmmPara.SSs[i];
+		SS.ss1 = (1 - coff) * SS.ss1 + coff * photon.weight * gamma[i] / gammaSum;
+		SS.ss2 = (1 - coff) * SS.ss2 + coff * photon.weight * gamma[i] / gammaSum * photon.direction;
+		SS.ss3 = (1 - coff) * SS.ss3 + coff * photon.weight * gamma[i] / gammaSum * outerProduct(photon.direction, photon.direction);
+		gmmPara.SSs[i] = SS;
+	}
+
+}
+
+void M_Step(inout GMMPara gmmPara, uint photonNum){
+
+	for(int i = 0; i < K; i++){
+		
+		GaussianPara gp;
+		Sufficient_Statistic ss = gmmPara.SSs[i];
+
+		gp.mixWeight = (ss.ss1 / gmmPara.photonAvgWeight + float(v - 1) / photonNum) / (1 + K * float(v - 1) / photonNum);
+		gp.mean = ss.ss2 / ss.ss1;
+
+		mat2 bE = mat2(vec2(b / photonNum, 0.0f), vec2(0.0f, b / photonNum));
+		mat2 A = outerProduct(ss.ss2, gp.mean) + outerProduct(gp.mean, ss.ss2);
+		mat2 B = outerProduct(gp.mean, gp.mean);
+		gp.covarianceMatrix = (bE + (ss.ss3 - A + ss.ss1 * B) / gmmPara.photonAvgWeight) / ((a - 2) / photonNum + ss.ss1 / gmmPara.photonAvgWeight);
+
+		gmmPara.gaussianParas[i] = gp;
+
+	}
+
+}
+
+void getVaildRadius(inout GMMPara gmmPara, mat3 TBN){
+	
+	float vaildRadius = 0.0f;
+	for(int i = 0; i < K; i++){
+
+		mat2 covMatrix = gmmPara.gaussianParas[i].covarianceMatrix;
+		float lambda = 1.0f / (covMatrix[0].x * 1000.0f * covMatrix[1].y) * max(covMatrix[0].x, covMatrix[1].y) * 1000.0f;	//防止方差过小，超出浮点数精度
+		float maxDistance = sqrt(5.0f / lambda);
+
+		vec3 gmmMeanDirection = concentricMapping_hemisphere_2DTo3D(vec2(gmmPara.gaussianParas[i].mean.x, 0.0f), mat3(1.0f));
+		//vec3 tangent;
+		//if(abs(gmmMeanDirection.x) > abs(gmmMeanDirection.y))
+		//    tangent = vec3(gmmMeanDirection.z, 0, -gmmMeanDirection.x);
+		//else
+		//    tangent = vec3(0, -gmmMeanDirection.z, gmmMeanDirection.y);
+		//tangent = normalize(tangent);
+		//vec3 bitangent = normalize(cross(gmmMeanDirection, tangent));
+		//TBN = mat3(tangent, bitangent, gmmMeanDirection);
+
+		vec2 direction_2D = vec2(min(maxDistance + gmmPara.gaussianParas[i].mean.x, 1.0f), 0.0f);
+		vec3 direction = concentricMapping_hemisphere_2DTo3D(direction_2D, mat3(1.0f));
+
+		float vaildRadiusK = gmmPara.photonAvgDistance * tan(acos(max(dot(direction, gmmMeanDirection), 0.01f)));
+		vaildRadius += 1 / (gmmPara.gaussianParas[i].mixWeight / vaildRadiusK);
+	}
+
+	gmmPara.r = vaildRadius;
+
+}
+
+//----------------------------getDirection-------------------------------------------
+
+//需要材质、TBN
+vec3 getRayFromBxdf(Material material, mat3 TBN, vec3 i, vec3 normal, float randomNumber, inout float pdf){
+
+	vec2 randomNumberH = Hammersley(uint(randomNumber * 100), 100);
+
+	float roughness =  max(material.bxdfPara.x, 0.1f);	//若粗糙度为0，D将是0/0，且趋近于无穷，除非分子上是a4，但是又会导致不是趋近于0时的值的错误
+	float a2 = roughness * roughness * roughness * roughness;
+	float phi = 2.0 * PI * randomNumberH.x;
+	//若roughness是1，则cosTheta是sqrt(1-randomNumberH.y)，所以完全粗糙的情况下，就是cos加权，且pdf也就是cosTheta / PI
+	float cosTheta = sqrt((1.0 - randomNumberH.y) / (1.0 + (a2 - 1.0) * randomNumberH.y));
+	float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+	vec3 h = normalize(vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta));
+	h = normalize(TBN * h);
+
+	float d = (a2 - 1) * cosTheta * cosTheta + 1;
+	float D = a2 / (PI * d * d);
+	pdf = D * cosTheta;	//h的pdf
+
+	vec3 rayDirection = normalize(2.0f * dot(h, i) * h - i);
+
+	if(dot(rayDirection, normal) > 0.0f){
+		pdf = pdf / (4 * dot(h, i));	//出射的pdf
+	}else{
+		rayDirection = h;	//将h当作出射向量
+	}
+
+	pdf = clamp(pdf, 0.01f, 1.0f);
+	return rayDirection;
+
+}
+
+mat2 Cholesky(mat2 covMatrix){
+	mat2 L = mat2(0.0f);
+	float l00 = sqrt(covMatrix[0][0]);
+	L[0][0] = l00;
+	L[0][1] = covMatrix[0][1] / l00;
+	float l11 = sqrt(covMatrix[1][1] - L[0][1] * L[0][1]);
+	L[1][1] = l11;
+	return L;
+}
+
+vec2 sample2DGussian(GaussianPara gp, inout uint randomNumberSeed, inout float pdf){
+
+	mat2 covMatrix = gp.covarianceMatrix;
+	vec2 mean = gp.mean;
+
+	mat2 L = Cholesky(covMatrix);	//协差阵是正定的
+
+	//Box-Muller变换
+	//vec2 randomNumber = Hammersley(uint(rand(randomNumberSeed) * 100), 100) * 0.5f + rand(randomNumberSeed) * 0.5f;
+	vec2 randomNumber = vec2(rand(randomNumberSeed), rand(randomNumberSeed));
+	float X = sqrt(-2.0f * log(randomNumber.x)) * cos(2.0f * PI * randomNumber.y);
+	float Y = sqrt(-2.0f * log(randomNumber.x)) * sin(2.0f * PI * randomNumber.y);
+
+	vec2 direction = mean + L * vec2(X, Y);
+	pdf = clamp(GaussianPdf(gp, direction), 0.01f, 1.0f);
+	return direction;
+
+}
+
+GMMPara makeGMM(vec3 hitPos, mat3 TBN){
+
+	GMMPara gmmParaNew;
+	gmmParaNew.pos = vec4(hitPos, 0.0f);
+	gmmParaNew.normal = vec4(TBN[2], 0.0f);
+	vec2 st[4] = vec2[4](vec2(0.8535f, 0.8535f), vec2(0.1465f, 0.8535f), vec2(0.1465f, 0.1465f), vec2(0.8535f, 0.1465f));
+	for(int i = 0; i < K; i++){
+
+		Sufficient_Statistic SS;
+		SS.ss1 = 0.0f;
+		SS.ss2 = vec2(0.0f);
+		SS.ss3 = mat2(1.0f);
+		gmmParaNew.SSs[i] = SS;
+
+		GaussianPara gp;
+		gp.mixWeight = 0.125f;
+		gp.mean = st[i];
+		gp.covarianceMatrix = mat2(1.0f);
+		gmmParaNew.gaussianParas[i] = gp;
+
+	}
+	gmmParaNew.photonAvgWeight = 0.0f;
+	gmmParaNew.photonAvgDistance = 0.0f;
+	gmmParaNew.photonNum = 0;
+	gmmParaNew.lastUse = 0;
+	bool onlineEM = false;
+	
+	Photon offlineEM_photons[m];
+	for(int i = 0; i < gmmConstant.photonTracingNum; i++){
+		PhotonTracingResult result = photonTracingResults[i];
+		for(int j = 0; j < result.photonNum; j++){
+
+			Photon photon = result.photons[j];
+
+			float distance = length(photon.hitPos.xyz - hitPos);
+			if(distance > getPhotonRange){		//我们认为距离在某个范围内的光子可以用于训练，论文中没有明说
+				continue;
+			}
+
+			if(dot(photon.normal.xyz, TBN[2]) <= 0.0f || dot(photon.direction_3D.xyz, TBN[2]) <= 0.0f){
+				continue;
+			}
+
+			photon.direction = concentricMapping_hemisphere_3DTo2D(photon.direction_3D.xyz, TBN);
+			gmmParaNew.photonAvgDistance = (gmmParaNew.photonAvgDistance * gmmParaNew.photonNum + length(photon.startPos.xyz - hitPos)) / (gmmParaNew.photonNum + 1);
+			if(!onlineEM){
+				offlineEM_photons[gmmParaNew.photonNum] = photon;
+			}
+			gmmParaNew.photonNum++;
+
+			if(gmmParaNew.photonNum % m == 0){	
+				if(!onlineEM){
+					E_Step(gmmParaNew, photon, m);
+					M_Step(gmmParaNew, m);
+					//作者说off-line要迭代10次，但是我们的光子很少（文章说要100万个每帧，而我们只有1024个），所以还是10次的话会过拟合，所以我们迭代3次
+					for(int s = 0; s < 2; s++){
+						for(int t = 0; t < m; t++){
+							gmmParaNew.photonNum++;
+							E_Step(gmmParaNew, offlineEM_photons[t], m);
+						}
+						M_Step(gmmParaNew, m);
+					}
+					onlineEM = true;
+				}else{
+					E_Step(gmmParaNew, photon, gmmParaNew.photonNum);
+					M_Step(gmmParaNew, gmmParaNew.photonNum);
+				}
+			}else{
+				E_Step(gmmParaNew, photon, gmmParaNew.photonNum);		//当前体素新接受的光子还没到10个时，更新充分统计量，但不更新参数
+			}
+
+			break;	//虽然光子可能弹回来，但是概率很小，且强度也会很低，所以一个photonPath只考虑一个
+	
+		}
+	}
+
+	//如果周围有光子，但是不到m个
+	if(gmmParaNew.photonNum > 0){
+		if(gmmParaNew.photonNum < m){
+			M_Step(gmmParaNew, gmmParaNew.photonNum);
+			uint photonNum = gmmParaNew.photonNum;
+			for(int s = 0; s < 2; s++){
+				for(int t = 0; t < photonNum; t++){
+					gmmParaNew.photonNum++;
+					E_Step(gmmParaNew, offlineEM_photons[t], gmmParaNew.photonNum);
+				}
+				M_Step(gmmParaNew, gmmParaNew.photonNum);
+			}
+		}
+		getVaildRadius(gmmParaNew, TBN);
+	}
+
+	return gmmParaNew;
+
+}
+
+vec3 getRayFromPhotonGuide(vec3 hitPos, mat3 TBN, inout uint randomNumberSeed, inout float pdf){
+
+	vec3 normal = TBN[2];
+
+	ivec3 voxelIndexXYZ = ivec3((hitPos - gmmConstant.voxelStartPos.xyz) / gmmConstant.voxelSize);
+	uint voxelIndex = voxelIndexXYZ.z * gmmConstant.voxelNum.x * gmmConstant.voxelNum.y + voxelIndexXYZ.y * gmmConstant.voxelNum.x + voxelIndexXYZ.x;
+
+	int gmmIndex[3] = int[3](-1, -1, -1);
+	float gmmDistance[3] = float[3](100.0f, 100.0f, 100.0f);
+	//查询周围9个体素
+	for(int x = -1; x < 2; x++){
+		for(int y = -1; y < 2; y++){
+			for(int z = -1; z < 2; z++){
+
+				ivec3 voxelIndexXYZTemp = voxelIndexXYZ + ivec3(x, y, z);
+				bool hasNegative1 = any(lessThan(voxelIndexXYZTemp, ivec3(0)));
+				bool hasNegative2 = any(lessThan(gmmConstant.voxelNum.xyz - voxelIndexXYZTemp - 1, ivec3(0)));
+				if(hasNegative1 || hasNegative2){
+					continue;
+				}
+
+				uint voxelIndexTemp = voxelIndexXYZTemp.z * gmmConstant.voxelNum.x * gmmConstant.voxelNum.y + voxelIndexXYZTemp.y * gmmConstant.voxelNum.x + voxelIndexXYZTemp.x;
+
+				for(int i = 0; i < gmmPerVoxel; i++){
+					GMMPara gmmPara = gmmParas[gmmPerVoxel * voxelIndexTemp + i];
+					if(gmmPara.r == 0.0f){
+						continue;
+					}
+					float distance = length(hitPos - gmmPara.pos.xyz);
+					int k = gmmDistance[0] >= gmmDistance[1] ? (gmmDistance[0] >= gmmDistance[2] ? 0 : 2) : (gmmDistance[1] >= gmmDistance[2] ? 1 : 2);
+					if(distance < gmmDistance[k]){
+						gmmIndex[k] = int(gmmPerVoxel * voxelIndexTemp) + i;
+						gmmDistance[k] = distance;
+					}
+				}
+				
+			}
+		}
+	}
+
+	int gmmNum = 0;
+	float maxDistance = 0.0f;
+	for(int i = 0; i < 3; i++){
+		if(gmmIndex[i] > -1){
+			gmmNum++;
+			maxDistance = maxDistance < gmmDistance[i] ? gmmDistance[i] : maxDistance;
+		}
+	}
+	float weight = 100.0f;
+	GMMPara gmmPara;
+	int selectGMMIndex;
+	for(int i = 0; i < gmmNum; i++){
+		GMMPara gmmParaTemp = gmmParas[gmmIndex[i]];
+		float weightTemp = length(gmmParaTemp.pos.xyz - hitPos) / maxDistance + 2.0f * sqrt(1 - dot(normal, gmmParaTemp.normal.xyz));
+		if(weightTemp > 0.0f && weightTemp < weight){
+			weight = weightTemp;
+			gmmPara = gmmParaTemp;
+			selectGMMIndex = gmmIndex[i];
+		}
+	}
+	if(gmmNum > 0 && gmmPara.r >= length(gmmPara.pos.xyz - hitPos)){
+		gmmParas[gmmIndex[selectGMMIndex]].lastUse = 0;
+		//使用GMM获得采样向量
+		randomNumberSeed++;
+		float randomNumber = rand(randomNumberSeed);
+		float probability = 0.0f;
+		for(int i = 0; i < K; i++){
+			probability += gmmPara.gaussianParas[i].mixWeight;
+			if(randomNumber < probability){
+				return concentricMapping_hemisphere_2DTo3D(sample2DGussian(gmmPara.gaussianParas[i], randomNumberSeed, pdf), TBN);
+			}
+		}
+	}
+
+	//需要创建一个GMM
+	GMMPara gmmParaNew = makeGMM(hitPos, TBN);
+	if(gmmParaNew.r == 0.0f){
+		pdf = 0;
+		return vec3(1.0f);
+	}
+
+	gmmNum = 0;
+	int emptyGMM = -1;
+	for(int i = 0; i < gmmPerVoxel; i++){
+		if(gmmParas[voxelIndex * gmmPerVoxel + i].r > 0.0f){
+			gmmNum += 1;
+		}else{
+			emptyGMM = i;
+		}
+	}
+
+	//需要替换gmm，根据光子强度，使用频率
+	if(gmmNum == gmmPerVoxel){
+
+		float lastUseSum = 0.0f;
+		float photonAvgWeightSum = 0.0f;
+		for(int i = 0; i < gmmNum; i++){
+			GMMPara gmmParaTemp = gmmParas[voxelIndex * gmmPerVoxel + i];
+			lastUseSum += gmmParaTemp.lastUse * gmmParaTemp.lastUse;
+			photonAvgWeightSum += gmmParaTemp.photonAvgWeight;
+		}
+
+		float weightMin = 0.0f;
+		for(int i = 0; i < gmmNum; i++){
+			GMMPara gmmParaTemp = gmmParas[voxelIndex * gmmPerVoxel + i];
+			float weight = gmmParaTemp.lastUse * gmmParaTemp.lastUse / lastUseSum + 1.0f - gmmParaTemp.photonAvgWeight / photonAvgWeightSum;
+			if(weight < weightMin){
+				weightMin = weight;
+				emptyGMM = i;
+			}
+		}
+
+	}
+
+	gmmParas[voxelIndex * gmmPerVoxel + emptyGMM] = gmmParaNew;
+
+	//使用GMM获得采样向量
+	randomNumberSeed++;
+	float randomNumber = rand(randomNumberSeed);
+	float probability = 0.0f;
+	for(int i = 0; i < K; i++){
+		probability += gmmParaNew.gaussianParas[i].mixWeight;
+		if(randomNumber < probability){
+			return concentricMapping_hemisphere_2DTo3D(sample2DGussian(gmmParaNew.gaussianParas[i], randomNumberSeed, pdf), TBN);
+		}
+	}
+
+	pdf = 0.0f;
+	return vec3(0.0f);
+
+	
+}
+
+//-----------------------------------hitTest-----------------------------------------------
+
+//AABB碰撞检测，-1表示没有碰撞到，0表示碰撞到了且不是在场景内部，1表示在场景内部
+bool hitAABB(AABBBox AABB, Ray ray){
+
+	//这里并不能检测出是否朝向AABB，反而会导致原本该命中的被剔除了，尤其是有些vertex，其发射方向与AABB中心除以一个夹角，导致只有与夹角小于90度的地方才能命中
+	//vec3 AABBCenter = vec3(AABB.leftX + (AABB.rightX - AABB.leftX) / 2, 
+	//					   AABB.leftY + (AABB.rightY - AABB.leftY) / 2,
+	//					   AABB.leftZ + (AABB.rightZ - AABB.leftZ) / 2);
+	////判断ray的方向是否朝向AABB，并且不能射向发射点的AABB
+	//if(dot(AABBCenter - ray.startPos, ray.direction) <= 0.0f){
+	//	return false;
+	//}
+	
+	//判断光线是不是在场景内部发出的，如果是还不能直接抛弃别的场景
+	//虽然会导致每次都与自身发射点的AABB再检测一次hitMesh
+	if(ray.startPos.x > AABB.leftX && ray.startPos.x < AABB.rightX && 
+	   ray.startPos.y > AABB.leftY && ray.startPos.y < AABB.rightY &&
+	   ray.startPos.z > AABB.leftZ && ray.startPos.z < AABB.rightZ){
+		return true;
+	}
+
+	float maxInTime = 0.0f;
+	float minOutTime = 1000000.0f;	//超了再说
+
+	if(ray.direction.x != 0){	//直射与面都不考虑
+		float leftX = (AABB.leftX - ray.startPos.x) / ray.direction.x;
+		float rightX= (AABB.rightX - ray.startPos.x) / ray.direction.x;
+		maxInTime = max(min(leftX, rightX), maxInTime);
+		minOutTime = min(max(leftX, rightX), minOutTime);
+	}
+
+	if(ray.direction.y != 0){
+		float leftY = (AABB.leftY - ray.startPos.y) / ray.direction.y;
+		float rightY = (AABB.rightY - ray.startPos.y) / ray.direction.y;
+		maxInTime = max(min(leftY, rightY), maxInTime);
+		minOutTime = min(max(leftY, rightY), minOutTime);
+	}
+
+	if(ray.direction.z != 0){
+		float leftZ = (AABB.leftZ - ray.startPos.z) / ray.direction.z;
+		float rightZ = (AABB.rightZ - ray.startPos.z) / ray.direction.z;
+		maxInTime = max(min(leftZ, rightZ), maxInTime);
+		minOutTime = min(max(leftZ, rightZ), minOutTime);
+	}
+
+	if(minOutTime < maxInTime){
+		return false;
+	}
+
+	//直接用包围盒中点算可能会导致前面的mesh的AABB的depth反而比后面的大，导致被剔除
+	if(maxInTime > ray.depth){
+		return false;	//深度测试不通过
+	}
+
+	return true;
+	
+
+}
+
+//返回碰撞点的mesh索引、三角形面片的第一个indicis索引，没碰撞到则不动
+void hitMesh(inout Ray ray, uint meshIndex, inout ivec2 result){
+
+	Mesh mesh = meshs[meshIndex];
+
+	uint startVertexIndex = mesh.indexInIndicesArray.x;
+	uint endVertexIndex = mesh.indexInIndicesArray.y;
+	 
+	for(uint i = startVertexIndex; i < endVertexIndex; i += 3){
+		vec3 P0 = vertices[indices[i]].pos.xyz;
+		vec3 P1 = vertices[indices[i + 1]].pos.xyz;
+		vec3 P2 = vertices[indices[i + 2]].pos.xyz;
+
+		vec3 tangent = normalize(P1 - P0);
+		vec3 bitangent = normalize(P2 - P0);
+		vec3 normal = normalize(cross(tangent, bitangent));
+		if(dot(normal, -ray.direction) <= 0){
+			continue;
+		}
+
+		vec3 E1 = P1 - P0;
+		vec3 E2 = P2 - P0;
+		vec3 S = ray.startPos - P0;
+		vec3 S1 = cross(ray.direction, E2);
+		vec3 S2 = cross(S, E1);
+
+		vec3 tbb = 1 / dot(S1, E1) * vec3(dot(S2, E2), dot(S1, S), dot(S2, ray.direction));
+		if(tbb.x > 0 && (1.0f - tbb.y - tbb.z) > 0 && tbb.y > 0 && tbb.z > 0){	//打到了
+			if(tbb.x > ray.depth){
+				continue;	//深度测试没通过
+			}
+			result = ivec2(meshIndex, indices[i]);
+			ray.depth = tbb.x;
+			return;
+		}
+	}
+
+}
+
+//由于不能使用递归，我们需要采用栈的方式循环读取
+ivec2 hitScene(inout Ray ray){
+	
+	ivec2 result = ivec2(-1, -1);
+	//栈的大小需要和和bvh树节点总数相同（最坏情况），应该从CPU中uniform过来的，但是懒得写了，直接用个大小为10的数组，对于我们这个小场景应该够用了
+	//第一个表示sceneIndex，第二个是自身是哪个子树，第三个是父结点是否要去除
+	ivec3 sceneStack[15] = ivec3[15](ivec3(0, 1, 1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1),
+									 ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1));
+	int stackTop = 0;
+	while(stackTop >= 0){
+
+		if(sceneStack[stackTop].z == -1){	
+			int isRight = sceneStack[stackTop].y;
+			sceneStack[stackTop] = ivec3(-1, -1, -1);
+			stackTop -= 1;
+			if(isRight == 1){
+				sceneStack[stackTop].z = -1;
+			}
+			continue;
+		}
+
+		BvhArrayNode scene = bvhArrayNode[sceneStack[stackTop].x];
+		if(!hitAABB(scene.AABB, ray)){
+			int isRight = sceneStack[stackTop].y;
+			sceneStack[stackTop] = ivec3(-1, -1, -1);
+			stackTop -= 1;
+			if(isRight == 1){
+				sceneStack[stackTop].z = -1;
+			}
+			continue;
+		}
+
+		//若是叶子节点，则直接进行mesh碰撞
+		if(scene.leftNodeIndex == -1){
+			hitMesh(ray, scene.meshIndex, result);
+			int isRight = sceneStack[stackTop].y;
+			sceneStack[stackTop] = ivec3(-1, -1, -1);
+			stackTop -= 1;
+			if(isRight == 1){
+				sceneStack[stackTop].z = -1;
+			}
+			continue;
+		}
+
+		//先将左右子树压栈，先遍历左子树再右子树
+		stackTop += 1;
+		sceneStack[stackTop] = ivec3(scene.rightNodeIndex, 1, 1);
+		stackTop += 1;
+		sceneStack[stackTop] = ivec3(scene.leftNodeIndex, 0, 1);
+
+	}
+
+	return result;
+
+}
+
+//-------------------------------------------bxdf---------------------------------------------------------
+
+float DistributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+
+    float nom   = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return nom / denom;
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = (roughness + 1.0);
+    float k = (r * r) / 8.0;
+
+    float nom   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return nom / denom;
+}
+
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx2 = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1 = GeometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0)
+{
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+//若当前hitPoint是i，那么currentPos是i-1，startPos是i-2，也就是说只有当i >= 2时才计算weight
+vec3 getFr(vec3 startPos, vec3 currentPos, vec3 currentNormal, vec3 hitPos, Material material){
+
+	vec3 albedo = material.kd.rgb;
+	float roughness = material.bxdfPara.x;
+	float metallic = material.bxdfPara.y;
+	float refractivity = material.bxdfPara.z;
+
+	float diff_fr = 1 / (2 * PI);
+
+	vec3 F0 = vec3(0.04); 
+	F0 = mix(F0, albedo, metallic);
+
+	vec3 i = normalize(hitPos - currentPos);
+	vec3 o = normalize(startPos - currentPos);
+	vec3 h = normalize(i + o);
+	float NDF = DistributionGGX(currentNormal, h, roughness);        
+	float G = GeometrySmith(currentNormal, o, i, roughness);      
+	vec3 F = fresnelSchlick(max(dot(h, o), 0.0), F0); 
+
+	vec3 nominator = NDF * G * F;
+	float denominator = 4.0 * max(dot(currentNormal, o), 0.0) * max(dot(currentNormal, i), 0.0) + 0.001; 
+	vec3 spec_fr = nominator / denominator;
+
+	vec3 ks = F;
+	vec3 kd = vec3(1.0) - ks;
+	kd *= 1.0 - metallic;
+
+	return kd * albedo * diff_fr + ks * spec_fr;
+
+}
+
+
+//--------------------------------------------PhotonTracingTrain--------------------------------------
+void photonTracing(Ray ray, inout uint randomNumberSeed, uint photonTracingIndex){
+
+	vec3 normal;
+	mat3 TBN;
+	Material material;
+	float RR;
+	int lossNum = 0;
+	int maxLossNum = 50;
+	vec3 lastHitPos;
+	float startWeight = 0.299f * ray.radiance.x + 0.587f * ray.radiance.g + 0.114f * ray.radiance.b;
+	float pdf = 1.0;
+
+	ivec2 result = hitScene(ray);
+	while(lossNum < maxLossNum && result.x == -1){
+		randomNumberSeed++;
+		ray = makeStartPhoton(randomNumberSeed, pdf);
+		result = hitScene(ray);
+		lossNum++;
+	}
+	if(lossNum == maxLossNum){
+		return;
+	}
+
+	int meshIndex = result.x;
+	int vertexIndex = result.y;
+	vec3 hitPos = ray.startPos + ray.depth * ray.direction;
+	getHitPointNormalAndTBN(vertexIndex, normal, TBN);
+	material = meshs[meshIndex].material;
+
+	Photon photon;
+	photon.hitPos = vec4(hitPos, 0.0f);
+	photon.startPos = vec4(ray.startPos, 0.0f);
+	photon.normal = vec4(normal, 0.0f);
+	photon.direction_3D = vec4(-ray.direction, 0.0f);
+	photon.direction = concentricMapping_hemisphere_3DTo2D(-ray.direction, TBN);
+	photon.weight = (0.299f * ray.radiance.x + 0.587f * ray.radiance.g + 0.114f * ray.radiance.b) * dot(ray.normal, ray.direction) * dot(-ray.direction, normal) / pdf;
+	photonTracingResults[photonTracingIndex].photons[0] = photon;
+	photonTracingResults[photonTracingIndex].photonNum = 1;
+
+	if(material.bxdfPara.x > 0.9f){	//当前是漫反射平面，结束弹射
+		return;
+	}
+
+	RR = min(photon.weight / startWeight / 0.00001f, 1.0f);
+	if(rand(randomNumberSeed) > RR){
+		return;
+	}
+
+	//获得出射方向
+	ray.radiance = ray.radiance * dot(ray.normal, ray.direction) * dot(-ray.direction, normal) / RR;	//需要打到下个顶点时才可以计算bxdf
+	lastHitPos = ray.startPos;
+	ray.startPos = hitPos;
+	ray.direction = getRayFromBxdf(material, TBN, -ray.direction, normal, rand(randomNumberSeed), pdf);
+	ray.normal = normal;
+	ray.depth = 100.0f;
+
+	int maxIterationNum = 9;	//一共是10
+	while(maxIterationNum > 0){
+	
+		result = hitScene(ray);
+		lossNum = 0;
+		while(result.x == -1 && lossNum < maxLossNum){
+			randomNumberSeed++;
+			float randomNumber = 0.8f * (float(lossNum) / float(maxLossNum)) + 0.2f * rand(randomNumberSeed);
+			ray.direction = getRayFromBxdf(material, TBN, normalize(lastHitPos - ray.startPos), normal, randomNumber, pdf);
+			result = hitScene(ray);
+			lossNum++;
+		}
+		if(lossNum == maxLossNum){
+			return;
+		}
+
+		int meshIndex = result.x;
+		int vertexIndex = result.y;
+		vec3 hitPos = ray.startPos + ray.depth * ray.direction;
+		getHitPointNormalAndTBN(vertexIndex, normal, TBN);
+
+		//计算光子强度的衰减fr项
+		ray.radiance *= getFr(hitPos, ray.startPos, ray.normal, lastHitPos, material) / pdf;	//现在的材质还是上一个的
+		material = meshs[meshIndex].material;
+
+		photon.hitPos = vec4(hitPos, 0.0f);
+		photon.startPos = vec4(ray.startPos, 0.0f);
+		photon.normal = vec4(normal, 0.0f);
+		photon.direction_3D = vec4(-ray.direction, 0.0f);
+		photon.direction = concentricMapping_hemisphere_3DTo2D(-ray.direction, TBN);
+		photon.weight = (0.299f * ray.radiance.x + 0.587f * ray.radiance.g + 0.114f * ray.radiance.b) * dot(-ray.direction, normal) / pdf / RR;
+
+		uint photonNum = photonTracingResults[photonTracingIndex].photonNum;
+		photonTracingResults[photonTracingIndex].photons[photonNum] = photon;
+		photonTracingResults[photonTracingIndex].photonNum = photonNum + 1;
+
+		if(material.bxdfPara.x > 0.9f){	//当前是漫反射平面，结束弹射
+			return;
+		}
+
+		RR = min(photon.weight / startWeight / 0.00001f, 1.0f);
+		if(rand(randomNumberSeed) > RR){
+			return;
+		}
+
+		//获得出射方向
+		ray.radiance = ray.radiance * dot(-ray.direction, normal) / pdf / RR;	//需要打到下个顶点时才可以计算bxdf
+		lastHitPos = ray.startPos;
+		ray.startPos = hitPos;
+		ray.direction = getRayFromBxdf(material, TBN, -ray.direction, normal, rand(randomNumberSeed), pdf);
+		ray.normal = normal;
+		ray.depth = 100.0f;
+
+		maxIterationNum--;
+	
+	}
+
+}
+
+//-----------------------------------------------------updateGMM------------------------------------------------
+
+void updateGMM(uint gmmIndex){
+
+	GMMPara gmmPara = gmmParas[gmmIndex];
+
+	if(gmmPara.r == 0.0f){	//只更新不创建
+		return;
+	}
+	gmmPara.lastUse += 1;
+
+	vec3 tangent;
+	if(abs(gmmPara.normal.x) > abs(gmmPara.normal.y))
+        tangent = vec3(gmmPara.normal.z, 0, -gmmPara.normal.x);
+    else
+        tangent = vec3(0, -gmmPara.normal.z, gmmPara.normal.y);
+	tangent = normalize(tangent);
+    vec3 bitangent = normalize(cross(gmmPara.normal.xyz, tangent));
+	mat3 TBN = mat3(tangent, bitangent, gmmPara.normal.xyz);
+
+	for(int i = 0; i < gmmConstant.photonTracingNum; i++){
+		PhotonTracingResult result = photonTracingResults[i];
+		for(int j = 0; j < result.photonNum; j++){
+
+			Photon photon = result.photons[j];
+
+			float distance = length(photon.hitPos.xyz - gmmPara.pos.xyz);
+			if(distance > getPhotonRange){		//我们认为距离在某个范围内的光子可以用于训练，论文中没有明说
+				continue;
+			}
+
+			if(dot(photon.normal.xyz, gmmPara.normal.xyz) <= 0.0f || dot(photon.direction_3D.xyz, gmmPara.normal.xyz) <= 0.0f){
+				continue;
+			}
+
+			photon.direction = concentricMapping_hemisphere_3DTo2D(photon.direction_3D.xyz, TBN);
+			gmmPara.photonAvgDistance = (gmmPara.photonAvgDistance * gmmPara.photonNum + length(photon.startPos.xyz - gmmPara.pos.xyz)) / (gmmPara.photonNum + 1);
+			gmmPara.photonNum++;	//这里可能会出现超出uint范围的可能
+			E_Step(gmmPara, photon, gmmPara.photonNum);
+			if(gmmPara.photonNum % m == 0){
+				M_Step(gmmPara, gmmPara.photonNum);
+			}
+
+		}
+	}
+
+	getVaildRadius(gmmPara, TBN);
+
+	gmmParas[gmmIndex] = gmmPara;
+
+}
+
+//---------------------------------------------getRadiance--------------------------------------------
+
+float getShadow(vec3 worldPos, vec3 lightPos){
+
+	
+	vec4 clipPos = lubo.proj * lubo.view * lubo.model * vec4(worldPos, 1.0f);
+	vec3 ndcPos = clipPos.xyz / clipPos.w;
+	vec2 uv = (ndcPos.xy * 0.5f + 0.5f);
+
+	float depth = texture(shadowMap, uv).x;
+	if(ndcPos.z + 0.001f < depth){
+		return 1.0f;
+	}
+	return 0.0f;
+	
+
+	/*
+	Ray ray;
+	ray.startPos = worldPos;
+	ray.direction = normalize(lightPos - worldPos);
+	ray.depth = 100.0f;
+	
+	hitScene(ray);
+	return abs(ray.depth - length(lightPos - worldPos)) < 0.05f ? 1.0f : 0.0f;
+	*/
+
+}
+
+vec3 getRadianceFromLight(vec3 startPos, vec3 hitPos, vec3 normal, Material material){
+
+	vec3 radiance = vec3(0.0f);
+
+	vec3 lightPos = lubo.lightPos.xyz;
+	vec3 lightNormal = normalize(lubo.normal.xyz);
+	vec4 lightSize = lubo.size;
+
+	float pdf = 1 / float(lightA);
+	vec3 o = normalize(startPos - hitPos);
+	vec3 Li = lightStrength / float(lightA);
+	float diff_fr = 1 / (2 * PI);
+
+	vec3 albedo = material.kd.rgb;
+	float roughness = material.bxdfPara.x;
+	float metallic = material.bxdfPara.y;
+	float refractivity = material.bxdfPara.z;
+
+	vec3 F0 = vec3(0.04); 
+	F0 = mix(F0, albedo, metallic);
+
+	//将面光源分为kxk的小点光源
+	for(int i = 1; i < sqrtLightA * 2; i += 2){
+		vec3 lightPointPos = lightPos + vec3(lightSize.x, 0.0f, 0.0f) * i / (sqrtLightA * 2);
+		for(int j = 1; j < sqrtLightA * 2; j += 2){
+
+			lightPointPos = lightPos + vec3(0.0f, 0.0f, lightSize.z) * j / (sqrtLightA * 2);
+			
+			vec3 i = normalize(lightPointPos - hitPos);
+			vec2 cosTheta = vec2(max(dot(-i, lightNormal), 0.0f), max(dot(i, normal), 0.0f));
+			float distance = max(length(lightPointPos - hitPos), 1.0f);
+
+			float other = cosTheta.x * cosTheta.y / (distance * distance);
+
+			vec3 h = normalize(i + o);
+			float NDF = DistributionGGX(normal, h, roughness);        
+			float G = GeometrySmith(normal, o, i, roughness);      
+			vec3 F = fresnelSchlick(max(dot(h, o), 0.0), F0); 
+
+			vec3 nominator = NDF * G * F;
+			float denominator = 4.0 * max(dot(normal, o), 0.0) * max(dot(normal, i), 0.0) + 0.001; 
+			vec3 spec_fr = nominator / denominator;
+
+			vec3 ks = F;
+			vec3 kd = vec3(1.0) - ks;
+			kd *= 1.0 - metallic;  
+
+			radiance += (kd * albedo * diff_fr + ks * spec_fr) * Li * other / pdf * getShadow(hitPos, lightPointPos);
+
+		}
+	}
+
+	return radiance / float(lightA);
+
+}
+
+//计算撞击点的自发光
+vec3 getRadianceFromHitPoint(Material material, vec3 startPos, vec3 hitPos, vec3 hitNormal) {
+	
+	if(material.ke.rgb != vec3(0.0f)){
+		float cosTheta = dot(normalize(hitPos - startPos), hitNormal);
+		return material.ke.rgb / float(lightA) *  abs(cosTheta);	//场景就一个光源有自发光，所以写死
+	}
+	return vec3(0.0f);
+}
+
+//---------------------------------------------pathTracing---------------------------------------------
+vec3 pathTracing(Ray ray, uint randomNumberSeed){
+
+	vec3 radiance = vec3(0.0f);
+	vec3 normal;
+	mat3 TBN = mat3(1.0f);
+	vec3 hitPos = vec3(1.0f);
+	Material material;
+	float pdf = 1.0f;
+	float bxdfPdf = 1.0f;
+	float photonGuidePdf = 1.0f;
+	vec3 weight = vec3(1.0f);
+	float RR = 0.8f;	//轮盘赌概率
+
+	ivec2 result = hitScene(ray);
+	if(result.x == -1){
+		return vec3(0.0f);
+	}
+
+	int meshIndex = result.x;
+	int vertexIndex = result.y;
+	hitPos = ray.startPos + ray.depth * ray.direction;
+	getHitPointNormalAndTBN(vertexIndex, normal, TBN);	//计算面法线
+	material = meshs[meshIndex].material;
+
+	vec3 lightRadiance = getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
+	vec3 hitPointEmission = getRadianceFromHitPoint(material, ray.startPos, hitPos, normal);
+	vec3 irradiance = lightRadiance + hitPointEmission;
+	radiance += irradiance;		//weight = 1
+
+	float randomNumber = rand(randomNumberSeed);
+	randomNumber = smoothstep(0.0f, 1.0f, randomNumber);
+
+	if(randomNumber > RR){
+		return radiance;
+	}
+
+	vec3 bxdfDirection = getRayFromBxdf(material, TBN, -ray.direction, normal, randomNumber, bxdfPdf);
+	vec3 photonGuideDirection = getRayFromPhotonGuide(hitPos, TBN, randomNumberSeed, photonGuidePdf);
+	float pdfSum = bxdfPdf * bxdfPdf + photonGuidePdf * photonGuidePdf;
+	float bxdfPdfTemp = bxdfPdf * bxdfPdf / pdfSum;
+	if(rand(randomNumberSeed) < bxdfPdfTemp){
+		ray.direction = bxdfDirection;
+		pdf = bxdfPdf;
+	}else{
+		ray.direction = photonGuideDirection;
+		pdf = photonGuidePdf;
+	}
+
+	vec3 lastHitPos = ray.startPos;
+	ray.startPos = hitPos + 0.01f * ray.direction;	//加一点bias，其实没啥用，但是心里感觉有用，加上吧，心里踏实
+	ray.normal = normal;
+	ray.depth = 100.0f;
+
+	int lossNum = 0;
+	int lossNumMax = 10;
+	int maxShootNum = 3;
+	while(maxShootNum > 0){
+		
+		lossNum = 0;
+		ivec2 result = hitScene(ray);
+		while(lossNum <= lossNumMax && result.x == -1){
+
+			randomNumberSeed += lossNum * 100;
+			float randomNumber = 0.8f * (float(lossNum) / float(lossNumMax)) + 0.2f * rand(randomNumberSeed);
+
+			bxdfDirection = getRayFromBxdf(material, TBN, normalize(lastHitPos - ray.startPos), normal, randomNumber, bxdfPdf);
+			photonGuideDirection = getRayFromPhotonGuide(hitPos, TBN, randomNumberSeed, photonGuidePdf);
+			
+			pdfSum = bxdfPdf * bxdfPdf + photonGuidePdf * photonGuidePdf;
+			bxdfPdfTemp = bxdfPdf * bxdfPdf / pdfSum;
+			if(rand(randomNumberSeed) < bxdfPdfTemp){
+				ray.direction = bxdfDirection;
+				pdf = bxdfPdf;
+			}else{
+				ray.direction = photonGuideDirection;
+				pdf = photonGuidePdf;
+			}
+
+			ray.depth = 100.0f;
+
+			lossNum++;
+			result = hitScene(ray);
+
+		}
+		if(lossNum - 1 == lossNumMax){
+			return radiance;
+		}
+
+		int meshIndex = result.x;
+		int vertexIndex = result.y;
+		hitPos = ray.startPos + ray.depth * ray.direction;
+		getHitPointNormalAndTBN(vertexIndex, normal, TBN);		//计算面法线
+		material = meshs[meshIndex].material;
+
+		vec3 lightRadiance = getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
+		vec3 hitPointEmission = getRadianceFromHitPoint(material, ray.startPos, hitPos, normal);
+		vec3 irradiance = lightRadiance + hitPointEmission;
+		weight *= getFr(lastHitPos, ray.startPos, ray.normal, hitPos, material) * max(dot(ray.direction, ray.normal), 0.0f) / pdf / RR;
+		radiance += irradiance * weight;
+
+		randomNumberSeed++;
+		float randomNumber = rand(randomNumberSeed);
+		randomNumber = smoothstep(0.0f, 1.0f, randomNumber);
+
+		if(randomNumber > RR){
+			return radiance;
+		}
+
+		bxdfDirection = getRayFromBxdf(material, TBN, -ray.direction, normal, rand(randomNumberSeed), bxdfPdf);
+		photonGuideDirection = getRayFromPhotonGuide(hitPos, TBN, randomNumberSeed, photonGuidePdf);
+		
+		pdfSum = bxdfPdf * bxdfPdf + photonGuidePdf * photonGuidePdf;
+		bxdfPdfTemp = bxdfPdf * bxdfPdf / pdfSum;
+		if(rand(randomNumberSeed) < bxdfPdfTemp){
+			ray.direction = bxdfDirection;
+			pdf = bxdfPdf;
+		}else{
+			ray.direction = photonGuideDirection;
+			pdf = photonGuidePdf;		
+		}
+
+		lastHitPos = ray.startPos;
+		ray.startPos = hitPos;
+		ray.normal = normal;
+		ray.depth = 100.0f;
+
+		maxShootNum--;
+
+	}
+
+	return radiance;
+
+}
+
+
+//------------------------------------------------------------------------------------------------------
+void main(){
+	imageStore(pathTracingResult, ivec2(gl_GlobalInvocationID.xy), vec4(0.0f));
+	uvec2 seed2 = pcg2d(ivec2(gl_GlobalInvocationID) * (uint(cubo.randomNumber.w + cubo.randomNumber.x) + 1));
+	uint seed = seed2.x + seed2.y;
+	Ray ray;
+
+	//比如每帧发射128个光子，那么对于一个8*8的线程组，我们只需要两个线程组就可以完成了
+	uint workGroupSize = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+	uint workGroupIndex = gl_WorkGroupID.z * gl_NumWorkGroups.x * gl_NumWorkGroups.y + gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+	//不能直接用gl_GlobalInvocationID，因为我要尽量让一个worlGroup进行工作，现在相当于按组排序
+	uint threadIndex = workGroupIndex * workGroupSize + uint(gl_LocalInvocationIndex);
+	
+	if(threadIndex < gmmConstant.photonTracingNum){
+		float pdf;
+		ray = makeStartPhoton(seed, pdf);
+		photonTracingResults[threadIndex].photonNum = 0;		//每帧初始化
+		photonTracing(ray, seed, threadIndex);
+	}
+	memoryBarrierBuffer();	//要等待所有光子弹射完才能进行下一步
+	
+	//对已有的GMM进行更新，每个GPU线程对应一个体素（每个体素有若干个GMM）
+	uint voxelNum = gmmConstant.voxelNum.x * gmmConstant.voxelNum.y * gmmConstant.voxelNum.z;
+	uint threadNumSum = workGroupSize * gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_NumWorkGroups.z;	//所有开辟的线程数
+	//规定，i表示体素索引，当体素数量小于线程数时，gl_GlobalInvocationID表示体素索引；反之，可能有些线程需要处理两次
+	for(uint i = threadIndex; i < voxelNum * gmmPerVoxel; i += threadNumSum){
+		updateGMM(i);
+	}
+	memoryBarrierBuffer();
+
+	vec3 radiance = vec3(0.0f);
+	vec2 texelSize = 1.0f / (gl_WorkGroupSize * gl_NumWorkGroups).xy;
+	int sppNum = 1;
+	for(int i = 0; i < sppNum; i++){
+		vec2 texelUV = (vec2(gl_GlobalInvocationID.xy) + vec2(rand(seed), rand(seed))) * texelSize;
+		ray = makeStartRayFromCamera(texelUV);
+		seed += i;
+		radiance += pathTracing(ray, seed);
+	}
+
+	radiance /= sppNum;
+	imageStore(pathTracingResult, ivec2(gl_GlobalInvocationID.xy), vec4(radiance, 1.0f));
+
+}
