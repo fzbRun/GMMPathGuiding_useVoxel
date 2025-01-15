@@ -101,7 +101,6 @@ layout(set = 0, binding = 0) uniform LightUniformBufferObject {
 	vec4 lightPos;
 	vec4 normal;
 	vec4 size;
-	vec4 ex, ey;
 } lubo;
 
 layout(set = 1, binding = 0) uniform cameraUniformBufferObject {
@@ -517,16 +516,21 @@ GMMPara getGaussianPara_TrilinearInterpolation(vec3 hitPos){
 	//每个高斯的参数都要插值
 	for(int i = 0; i < K; i++){
 		
-		vec4 mixWeightEven = vec4(gmmPs[0].gaussianParas[i].mixWeight, gmmPs[2].gaussianParas[i].mixWeight, gmmPs[4].gaussianParas[i].mixWeight, gmmPs[6].gaussianParas[i].mixWeight);
-		vec4 mixWeightOdd = vec4(gmmPs[1].gaussianParas[i].mixWeight, gmmPs[3].gaussianParas[i].mixWeight, gmmPs[5].gaussianParas[i].mixWeight, gmmPs[7].gaussianParas[i].mixWeight);
-		vec4 mixWeight_mixX = (1.0f - weight.x) * mixWeightEven + weight.x * mixWeightOdd;
-		vec2 mixWeight_mixY = (1.0f - weight.y) * vec2(mixWeight_mixX.x, mixWeight_mixX.z) + weight.y * vec2(mixWeight_mixX.y, mixWeight_mixX.w);
-		gps[i].mixWeight = (1.0f - weight.z) * mixWeight_mixY.x + weight.z * mixWeight_mixY.y;
+		float mixWeight0 = (1.0f - weight.x) * gmmPs[0].gaussianParas[i].mixWeight + weight.x * gmmPs[1].gaussianParas[i].mixWeight;
+		float mixWeight1 = (1.0f - weight.x) * gmmPs[2].gaussianParas[i].mixWeight + weight.x * gmmPs[3].gaussianParas[i].mixWeight;
+		float mixWeight2 = (1.0f - weight.x) * gmmPs[4].gaussianParas[i].mixWeight + weight.x * gmmPs[5].gaussianParas[i].mixWeight;
+		float mixWeight3 = (1.0f - weight.x) * gmmPs[6].gaussianParas[i].mixWeight + weight.x * gmmPs[7].gaussianParas[i].mixWeight;
+		float mixWeight4 = (1.0f - weight.y) * mixWeight0 + weight.y * mixWeight1;
+		float mixWeight5 = (1.0f - weight.y) * mixWeight2 + weight.y * mixWeight3;
+		gps[i].mixWeight = (1.0f - weight.z) * mixWeight4 + weight.z * mixWeight5;
 
-		vec4 mean0 = (1.0f - weight.x) * vec4(gmmPs[0].gaussianParas[i].mean, gmmPs[2].gaussianParas[i].mean) + weight.x * vec4(gmmPs[1].gaussianParas[i].mean, gmmPs[3].gaussianParas[i].mean);
-		vec4 mean1 = (1.0f - weight.x) * vec4(gmmPs[4].gaussianParas[i].mean, gmmPs[6].gaussianParas[i].mean) + weight.x * vec4(gmmPs[5].gaussianParas[i].mean, gmmPs[7].gaussianParas[i].mean);
-		vec4 mean2 = (1.0f - weight.y) * vec4(mean0.xy, mean1.xy) + weight.y * vec4(mean0.zw, mean1.zw);
-		gps[i].mean = (1.0f - weight.z) * mean2.xy + weight.z * mean2.zw;
+		vec2 mean0 = (1.0f - weight.x) * gmmPs[0].gaussianParas[i].mean + weight.x * gmmPs[1].gaussianParas[i].mean;
+		vec2 mean1 = (1.0f - weight.x) * gmmPs[2].gaussianParas[i].mean + weight.x * gmmPs[3].gaussianParas[i].mean;
+		vec2 mean2 = (1.0f - weight.x) * gmmPs[4].gaussianParas[i].mean + weight.x * gmmPs[5].gaussianParas[i].mean;
+		vec2 mean3 = (1.0f - weight.x) * gmmPs[6].gaussianParas[i].mean + weight.x * gmmPs[7].gaussianParas[i].mean;
+		vec2 mean4 = (1.0f - weight.y) * mean0 + weight.y * mean1;
+		vec2 mean5 = (1.0f - weight.y) * mean2 + weight.y * mean3;
+		gps[i].mean = (1.0f - weight.z) * mean4 + weight.z * mean5;
 
 		mat2 covMatrix0 = (1.0f - weight.x) * gmmPs[0].gaussianParas[i].covarianceMatrix + weight.x * gmmPs[1].gaussianParas[i].covarianceMatrix;
 		mat2 covMatrix1 = (1.0f - weight.x) * gmmPs[2].gaussianParas[i].covarianceMatrix + weight.x * gmmPs[3].gaussianParas[i].covarianceMatrix;
@@ -540,7 +544,6 @@ GMMPara getGaussianPara_TrilinearInterpolation(vec3 hitPos){
 
 	GMMPara gmmp;
 	gmmp.gaussianParas = gps;
-	gmmp.photonNum = 1;
 	return gmmp;
 
 }
@@ -1080,65 +1083,6 @@ float getShadow(vec3 worldPos, vec3 lightPos){
 
 }
 
-//球面矩形采样
-vec3 sphereQuadSample(vec3 hitPos, float u, float v){
-	
-	vec3 O = hitPos;
-	vec3 x = normalize(lubo.ex.xyz);
-	vec3 y = normalize(lubo.ey.xyz);
-	vec3 z = cross(x, y);
-	
-	vec3 s = lubo.lightPos.xyz;
-	vec3 d = s - O;
-
-	float z0 = dot(d, z);
-	z *= -sign(z0);
-	z0 *= -sign(z0);
-	float z0sq = z0 * z0;
-
-	float x0 = dot(d, x);
-	float y0 = dot(d, y);
-	float y0sq = y0 * y0;
-
-	float x1 = x0 + length(lubo.ex);
-	float y1 = y0 + length(lubo.ey);
-	float y1sq = y1 * y1;
-
-	vec3 v00 = vec3(x0, y0, z0);
-	vec3 v01 = vec3(x0, y1, z0);
-	vec3 v10 = vec3(x1, y0, z0);
-	vec3 v11 = vec3(x1, y1, z0);
-
-	vec3 n0 = normalize(cross(v00, v10));
-	vec3 n1 = normalize(cross(v10, v11));
-	vec3 n2 = normalize(cross(v11, v01));
-	vec3 n3 = normalize(cross(v01, v00));
-
-	float g0 = acos(-dot(n0, n1));
-	float g1 = acos(-dot(n1, n2));
-	float g2 = acos(-dot(n2, n3));
-	float g3 = acos(-dot(n3, n0));
-
-	float b0 = n0.z;
-	float b1 = n2.z;
-	float b0sq = b0 * b0;
-	float k = 2 * PI - g2 - g3;
-	float S = g0 + g1 - k;
-
-	float au = u * S + k;
-	float fu = (cos(au) * b0 - b1) / sin(au);
-	float cu = sign(fu) / sqrt(fu * fu + b0sq);
-	float xu = -z0 * cu / sqrt(1 - cu * cu);
-	float dis = sqrt(xu * xu + z0sq);
-	float h0 = y0 / sqrt(dis * dis + y0sq);
-	float h1 = y1 / sqrt(dis * dis + y1sq);
-	float hv = h0 + v * (h1 - h0);
-	float hv2 = hv * hv;
-	float yv = hv * dis / sqrt(1 - hv2);
-	return O + xu * x + yv * y + z0 * z;
-
-}
-
 vec3 getRadianceFromLight(vec3 startPos, vec3 hitPos, vec3 normal, Material material){
 
 	//return vec3(0.0f);
@@ -1162,35 +1106,6 @@ vec3 getRadianceFromLight(vec3 startPos, vec3 hitPos, vec3 normal, Material mate
 	vec3 F0 = vec3(0.04); 
 	F0 = mix(F0, albedo, metallic);
 
-	for(int k = 0; k < lightA; k++){
-	
-		vec2 uv = Hammersley(k, uint(lightA));
-		vec3 lightPointPos = sphereQuadSample(hitPos, uv.x, uv.y);
-
-		vec3 i = normalize(lightPointPos - hitPos);
-		vec2 cosTheta = vec2(max(dot(-i, lightNormal), 0.0f), max(dot(i, normal), 0.0f));
-		float distance = max(length(lightPointPos - hitPos), 1.0f);
-
-		float other = cosTheta.x * cosTheta.y / (distance * distance);
-
-		vec3 h = normalize(i + o);
-		float NDF = DistributionGGX(normal, h, roughness);        
-		float G = GeometrySmith(normal, o, i, roughness);      
-		vec3 F = fresnelSchlick(max(dot(h, o), 0.0), F0); 
-
-		vec3 nominator = NDF * G * F;
-		float denominator = 4.0 * max(dot(normal, o), 0.0) * max(dot(normal, i), 0.0) + 0.001; 
-		vec3 spec_fr = nominator / denominator;
-
-		vec3 ks = F;
-		vec3 kd = vec3(1.0) - ks;
-		kd *= (1.0 - metallic) * material.bxdfPara.x;  
-
-		radiance += (kd * albedo * diff_fr + spec_fr) * Li * other / pdf * getShadow(hitPos, lightPointPos);
-	
-	}
-
-/*
 	//将面光源分为kxk的小点光源
 	for(int i = 1; i < sqrtLightA * 2; i += 2){
 		vec3 lightPointPos = lightPos + vec3(lightSize.x, 0.0f, 0.0f) * i / (sqrtLightA * 2);
@@ -1221,7 +1136,6 @@ vec3 getRadianceFromLight(vec3 startPos, vec3 hitPos, vec3 normal, Material mate
 
 		}
 	}
-*/
 
 	return radiance / float(lightA);
 
@@ -1307,7 +1221,7 @@ vec3 pathTracing(Ray ray, uint randomNumberSeed, int type, inout float pdfSum){
 	while(maxShootNum > 0){
 		
 		lossNum = 0;
-		result = hitScene(ray);
+		ivec2 result = hitScene(ray);
 		while(lossNum <= lossNumMax && result.x == -1){
 
 			randomNumberSeed++;
@@ -1331,8 +1245,8 @@ vec3 pathTracing(Ray ray, uint randomNumberSeed, int type, inout float pdfSum){
 
 		pdfSum *= pdf;
 
-		meshIndex = result.x;
-		vertexIndex = result.y;
+		int meshIndex = result.x;
+		int vertexIndex = result.y;
 		hitPos = ray.startPos + ray.depth * ray.direction;
 		getHitPointNormalAndTBN(vertexIndex, normal, TBN);		//计算面法线
 		lastMaterial = material;
@@ -1425,7 +1339,7 @@ void main(){
 		vec3 photonGuidingRadiance = pathTracing(ray, seed, 1, pdfPhotonGuiding);
 
 		float pdfSum = max(pdfBxDF * pdfBxDF + pdfPhotonGuiding * pdfPhotonGuiding, 0.0001f);
-		radiance += max(bxdfRadiance * (pdfBxDF * pdfBxDF / pdfSum) + photonGuidingRadiance * (pdfPhotonGuiding * pdfPhotonGuiding / pdfSum), 0.0f);
+		radiance += bxdfRadiance * (pdfBxDF * pdfBxDF / pdfSum) + photonGuidingRadiance * (pdfPhotonGuiding * pdfPhotonGuiding / pdfSum);
 		//radiance += bxdfRadiance * 0.5f + photonGuidingRadiance * 0.5f;
 		//radiance += photonGuidingRadiance;
 

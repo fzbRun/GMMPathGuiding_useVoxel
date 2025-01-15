@@ -200,6 +200,10 @@ struct UniformLightBufferObject {
 	glm::vec4 lightPos_strength;
 	glm::vec4 normal;
 	glm::vec4 size;
+
+	//球面矩形采样参数
+	glm::vec4 ex, ey;
+
 };
 
 struct DescriptorObject {
@@ -282,8 +286,8 @@ struct Sufficient_Statistic {
 
 };
 
+//#define Use3DTexture
 const int gmmNum = 6;
-
 struct GMMPara {
 
 	float photonAvgWeight;
@@ -291,14 +295,18 @@ struct GMMPara {
 	float padding1;
 	float padding2;
 	glm::vec4 pos;		//因为std430中vec3单独（不是数据的元素）传输时，对齐边界为vec4，所以我们在这里传vec4，但是shader中用vec3接收
+#ifndef Use3DTexture
 	GaussianPara gaussianParas[gmmNum];
+#endif
 	Sufficient_Statistic SSs[gmmNum];
 
 
 	GMMPara() {
 		pos = glm::vec4(0.0f);
 		for (int i = 0; i < gmmNum; i++) {
+#ifndef Use3DTexture
 			gaussianParas[i] = GaussianPara();
+#endif
 			SSs[i] = Sufficient_Statistic();
 		}
 		photonAvgWeight = 0.0f;

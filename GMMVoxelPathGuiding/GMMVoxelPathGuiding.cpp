@@ -159,13 +159,13 @@ private:
 
 	VkPipelineLayout gmmLightTrainPipelineLayout;
 	VkPipeline gmmLightTrainPipeline;
-	float GMMVoxelSize = 0.25f;
+	float GMMVoxelSize = 0.2f;
 	glm::ivec3 GMMVoxelNum;
 	uint32_t GMMVoxelNumSum;
 	uint32_t GMMMaxSize;
 	std::vector<GMMPara> gmmParas;
 	std::vector<PhotonTracingResult> photonTracingResults;
-	uint32_t photonNumPerFrame = 32 * 32;	//每帧发射若干个光子用于训练
+	uint32_t photonNumPerFrame = 16 * 32;	//每帧发射若干个光子用于训练
 
 	void initWindow() {
 
@@ -357,7 +357,7 @@ private:
 			1, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL,
 			VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
 			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-		pathTracingResult->transitionImageLayout(my_device->computeQueue, my_buffer->commandPool, pathTracingResult->image, VK_FORMAT_R8G8B8A8_UINT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 1);
+		pathTracingResult->transitionImageLayout(my_device->computeQueue, my_buffer->commandPool, pathTracingResult->image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 1);
 
 		shadowMap = std::make_unique<myImage>(my_device->physicalDevice, my_device->logicalDevice, my_swapChain->swapChainExtent.width, my_swapChain->swapChainExtent.height,
 			1, VK_SAMPLE_COUNT_1_BIT, myImage::findDepthFormat(my_device->physicalDevice), VK_IMAGE_TILING_OPTIMAL,
@@ -438,6 +438,8 @@ private:
 		lightUniform.lightPos_strength = glm::vec4(-0.24f, 1.95f, -0.22f, 50.0f);
 		lightUniform.normal = glm::vec4(0.0f, -1.0f, 0.0f, dis(gen));
 		lightUniform.size = glm::vec4(0.47f, 0.0f, 0.38f, 0.0f);
+		lightUniform.ex = glm::vec4(0.47f, 0.0f, 0.0f, 0.0f);
+		lightUniform.ey = glm::vec4(0.0f, 0.0f, 0.38f, 0.0f);
 		memcpy(my_buffer->uniformBuffersMappedsStatic[0], &lightUniform, sizeof(UniformLightBufferObject));
 
 		//相机MVP
@@ -467,7 +469,6 @@ private:
 			gmmParas.push_back(GMMPara());
 		}
 		my_buffer->createStaticBuffer(my_device->physicalDevice, my_device->logicalDevice, my_device->graphicsQueue, sizeof(GMMPara) * GMMVoxelNumSum * gmmPerVoxel, &gmmParas);
-
 
 	}
 
@@ -1086,8 +1087,8 @@ private:
 
 		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		pipelineLayoutInfo.setLayoutCount = 3;
-		std::array<VkDescriptorSetLayout, 3> computeDescriptorSetLayouts = { my_descriptor->descriptorObjects[0].discriptorLayout, my_descriptor->descriptorObjects[1].discriptorLayout, my_descriptor->descriptorObjects[2].discriptorLayout };
+		std::array<VkDescriptorSetLayout, 4> computeDescriptorSetLayouts = { my_descriptor->descriptorObjects[0].discriptorLayout, my_descriptor->descriptorObjects[1].discriptorLayout, my_descriptor->descriptorObjects[2].discriptorLayout,  my_descriptor->descriptorObjects[3].discriptorLayout };
+		pipelineLayoutInfo.setLayoutCount = computeDescriptorSetLayouts.size();
 		pipelineLayoutInfo.pSetLayouts = computeDescriptorSetLayouts.data();
 		if (vkCreatePipelineLayout(my_device->logicalDevice, &pipelineLayoutInfo, nullptr, &computePipelineLayout) != VK_SUCCESS) {
 			throw std::runtime_error("failed to create compute pipeline layout!");
@@ -1302,12 +1303,6 @@ private:
 
 		memcpy(my_buffer->uniformBuffersMappeds[0][currentFrame], &ubo, sizeof(ubo));
 
-		//标量必须按 N 对齐（= 32 位浮点数为 4 个字节）。
-		//Avec2必须按 2N（ = 8 个字节）对齐
-		//Avec3或vec4必须按 4N（ = 16 字节）对齐
-		//嵌套结构必须按其成员的基本对齐方式对齐，并向上四舍五入为 16 的倍数。
-		//矩阵mat4必须具有与之相同的对齐vec4。
-
 	}
 
 	void recreateSwapChain() {
@@ -1467,7 +1462,7 @@ private:
 
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipelineLayout, 0, 1, &my_descriptor->descriptorObjects[3].descriptorSets[0], 0, nullptr);
-		vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+		vkCmdDraw(commandBuffer, 3, 1, 0, 0);	//只渲染三个顶点，但是设置每个顶点的ndc坐标使其超出裁剪范围，最后剩下一个四边形
 
 		vkCmdEndRenderPass(commandBuffer);
 
