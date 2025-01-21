@@ -260,7 +260,7 @@ vec2 concentricMapping_hemisphere_3DTo2D(vec3 direction, mat3 TBN){
 	float y = min(abs(direction.x), abs(direction.y));
 	float r = sqrt(1.0f - direction.z);
 
-	float alphia = x == 0.0f ? 0.0f : y / x;
+	float alpha = x == 0.0f ? 0.0f : y / x;
 	float phi_2DivPI = (0.00000406531 + 0.636227 * alpha +  
             0.00615523 * alpha * alpha -
             0.247326 * alpha * alpha * alpha +
@@ -545,6 +545,31 @@ GMMPara getGaussianPara_TrilinearInterpolation(vec3 hitPos){
 
 }
 
+GMMPara getGaussianPara_Jittering(vec3 hitPos, uint randomNumberSeed){
+
+	hitPos -= gmmConstant.voxelStartPos.xyz;
+
+	ivec3 voxelIndexXYZ = ivec3(hitPos / gmmConstant.voxelSize);
+	uint voxelIndex = voxelIndexXYZ.z * gmmConstant.voxelNum.x * gmmConstant.voxelNum.y + voxelIndexXYZ.y * gmmConstant.voxelNum.x + voxelIndexXYZ.x;
+
+	ivec3 linearVoxel = ivec3(sign(hitPos - (vec3(voxelIndexXYZ) + 0.5f) * gmmConstant.voxelSize));
+	ivec3 linearVoxelIndexXYZ = voxelIndexXYZ + linearVoxel;
+	linearVoxelIndexXYZ.x = clamp(linearVoxelIndexXYZ.x, 0, gmmConstant.voxelNum.x - 1);
+	linearVoxelIndexXYZ.y = clamp(linearVoxelIndexXYZ.y, 0, gmmConstant.voxelNum.y - 1);
+	linearVoxelIndexXYZ.z = clamp(linearVoxelIndexXYZ.z, 0, gmmConstant.voxelNum.z - 1);
+
+	vec3 weight = abs((hitPos - (vec3(voxelIndexXYZ) + 0.5f) * gmmConstant.voxelSize) / gmmConstant.voxelSize);
+	ivec3 sampleVoxelXYZ;
+	float randomNum = rand(randomNumberSeed);
+	sampleVoxelXYZ.x = randomNum > weight.x ? linearVoxelIndexXYZ.x : voxelIndexXYZ.x;
+	randomNum = rand(randomNumberSeed);
+	sampleVoxelXYZ.y = randomNum > weight.y ? linearVoxelIndexXYZ.y : voxelIndexXYZ.y;
+	randomNum = rand(randomNumberSeed);
+	sampleVoxelXYZ.z = randomNum > weight.z ? linearVoxelIndexXYZ.z : voxelIndexXYZ.z;
+
+	return gmmParas[sampleVoxelXYZ.z * gmmConstant.voxelNum.x * gmmConstant.voxelNum.y + sampleVoxelXYZ.y * gmmConstant.voxelNum.x + sampleVoxelXYZ.x];
+
+}
 
 vec3 getRayFromPhotonGuide(vec3 hitPos, mat3 TBN, uint randomNumberSeed, inout float pdf){
 
@@ -554,6 +579,7 @@ vec3 getRayFromPhotonGuide(vec3 hitPos, mat3 TBN, uint randomNumberSeed, inout f
 	//uint voxelIndex = voxelIndexXYZ.z * gmmConstant.voxelNum.x * gmmConstant.voxelNum.y + voxelIndexXYZ.y * gmmConstant.voxelNum.x + voxelIndexXYZ.x;
 	//GMMPara gmmPara = gmmParas[voxelIndex];
 	GMMPara gmmPara = getGaussianPara_TrilinearInterpolation(hitPos);
+	//GMMPara gmmPara = getGaussianPara_Jittering(hitPos, randomNumberSeed);
 	if(gmmPara.photonNum == 0){
 		pdf = 0.0f;
 		return vec3(0.0f);
@@ -1263,7 +1289,7 @@ vec3 pathTracing(Ray ray, uint randomNumberSeed, int type, inout float pdfSum){
 	getHitPointNormalAndTBN(vertexIndex, normal, TBN);	//计算面法线
 	material = meshs[meshIndex].material;
 
-	vec3 lightRadiance = getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
+	vec3 lightRadiance = vec3(0);	//getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
 	vec3 hitPointEmission = getRadianceFromHitPoint(material, ray.startPos, hitPos, normal);
 	vec3 irradiance = lightRadiance + hitPointEmission;
 	radiance += irradiance;		//weight = 1
@@ -1338,7 +1364,7 @@ vec3 pathTracing(Ray ray, uint randomNumberSeed, int type, inout float pdfSum){
 		lastMaterial = material;
 		material = meshs[meshIndex].material;
 
-		vec3 lightRadiance = getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
+		vec3 lightRadiance = vec3(0);	//getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
 		vec3 hitPointEmission = getRadianceFromHitPoint(material, ray.startPos, hitPos, normal);
 		vec3 irradiance = lightRadiance + hitPointEmission;
 		weight *= getFr(lastHitPos, ray.startPos, ray.normal, hitPos, lastMaterial) * max(dot(ray.direction, ray.normal), 0.0f) / pdf / RR;
@@ -1412,7 +1438,7 @@ void main(){
 
 	vec3 radiance = vec3(0.0f);
 	vec2 texelSize = 1.0f / (gl_WorkGroupSize * gl_NumWorkGroups).xy;
-	int sppNum = 10;
+	int sppNum = 1;
 	for(int i = 0; i < sppNum; i++){
 
 		vec2 texelUV = (vec2(gl_GlobalInvocationID.xy) + vec2(rand(seed), rand(seed))) * texelSize;
@@ -1424,10 +1450,10 @@ void main(){
 		float pdfPhotonGuiding = 0.0f;
 		vec3 photonGuidingRadiance = pathTracing(ray, seed, 1, pdfPhotonGuiding);
 
-		float pdfSum = max(pdfBxDF * pdfBxDF + pdfPhotonGuiding * pdfPhotonGuiding, 0.0001f);
-		radiance += max(bxdfRadiance * (pdfBxDF * pdfBxDF / pdfSum) + photonGuidingRadiance * (pdfPhotonGuiding * pdfPhotonGuiding / pdfSum), 0.0f);
+		//float pdfSum = max(pdfBxDF * pdfBxDF + pdfPhotonGuiding * pdfPhotonGuiding, 0.0001f);
+		//radiance += max(bxdfRadiance * (pdfBxDF * pdfBxDF / pdfSum) + photonGuidingRadiance * (pdfPhotonGuiding * pdfPhotonGuiding / pdfSum), 0.0f);
 		//radiance += bxdfRadiance * 0.5f + photonGuidingRadiance * 0.5f;
-		//radiance += photonGuidingRadiance;
+		radiance += photonGuidingRadiance;
 
 	}
 

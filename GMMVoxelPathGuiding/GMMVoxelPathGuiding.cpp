@@ -31,6 +31,8 @@ const std::vector<const char*> deviceExtensions = {
 	VK_KHR_SWAPCHAIN_EXTENSION_NAME
 };
 
+#define Use3DTexture
+
 //如果不调试，则关闭校验层
 #ifdef NDEBUG
 const bool enableValidationLayers = false;
@@ -257,6 +259,22 @@ private:
 		//VkResult result = vkCreateInstance(&createInfo, nullptr, &instance);
 		if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
 			throw std::runtime_error("failed to create instance!");
+		}
+
+		uint32_t version;
+
+		// 获取 Vulkan 实例的版本
+		VkResult result = vkEnumerateInstanceVersion(&version);
+
+		if (result == VK_SUCCESS) {
+			uint32_t major = VK_API_VERSION_MAJOR(version);
+			uint32_t minor = VK_API_VERSION_MINOR(version);
+			uint32_t patch = VK_API_VERSION_PATCH(version);
+
+			std::cout << "Vulkan Version: " << major << "." << minor << "." << patch << std::endl;
+		}
+		else {
+			std::cout << "Failed to enumerate Vulkan version." << std::endl;
 		}
 
 	}
