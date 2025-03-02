@@ -21,7 +21,7 @@ def unPackUnorm2x16(value):
 #print(random_uint)
 #print(random / 128.0)
 
-random = glm.vec2(1.1, 0.00004)
+random = glm.vec2(1.9121112, 0.0001)
 random_uint = packUnorm2x16(random)
 random = unPackUnorm2x16(random_uint)
 print(random_uint)

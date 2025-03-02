@@ -161,13 +161,13 @@ private:
 
 	VkPipelineLayout gmmLightTrainPipelineLayout;
 	VkPipeline gmmLightTrainPipeline;
-	float GMMVoxelSize = 0.2f;
+	float GMMVoxelSize = 0.1f;
 	glm::ivec3 GMMVoxelNum;
 	uint32_t GMMVoxelNumSum;
 	uint32_t GMMMaxSize;
 	std::vector<GMMPara> gmmParas;
 	std::vector<PhotonTracingResult> photonTracingResults;
-	uint32_t photonNumPerFrame = 16 * 32;	//每帧发射若干个光子用于训练
+	uint32_t photonNumPerFrame = 32 * 32 * 16;	//每帧发射若干个光子用于训练
 
 	void initWindow() {
 

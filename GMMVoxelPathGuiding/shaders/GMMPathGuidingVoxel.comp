@@ -351,7 +351,7 @@ void E_Step(inout GMMPara gmmPara, Photon photon, uint photonNum){
 
 	for(int i = 0; i < K; i++){
 		GaussianPara gp = gmmPara.gaussianParas[i];
-		gamma[i] = photon.direction[i] == vec2(-1.0f) ? 0.0f : GaussianPdf(gp, photon.direction[i]);
+		gamma[i] = photon.direction[i] == vec2(-1.0f) ? 0.0f : GaussianPdf(gp, photon.direction[i]) * gp.mixWeight;
 		gammaSum += gamma[i];
 	}
 
@@ -375,10 +375,10 @@ void M_Step(inout GMMPara gmmPara, uint photonNum){
 		Sufficient_Statistic ss = gmmPara.SSs[i];
 
 		if(ss.ss1 == 0.0001f){		//说明来的光子一直都不是该半球的，导致充分统计量一直在乘以(1 - coff)，且一直加0，最后变为0
-			gp.mixWeight = 0.0f;	
-			gp.mean = vec2(0.0f);	//现在我将二维坐标范围改到(-1, 1)，这样(0, 0)就是中心，即坐标轴方向
-			gp.covarianceMatrix = mat2(1.0f);
-			gmmPara.gaussianParas[i] = gp;
+			//gp.mixWeight = 0.0f;	
+			//gp.mean = vec2(0.0f);	//现在我将二维坐标范围改到(-1, 1)，这样(0, 0)就是中心，即坐标轴方向
+			//gp.covarianceMatrix = mat2(1.0f);
+			//gmmPara.gaussianParas[i] = gp;
 			continue;
 		}
 
@@ -578,7 +578,7 @@ vec3 getRayFromPhotonGuide(vec3 hitPos, mat3 TBN, uint randomNumberSeed, inout f
 	//ivec3 voxelIndexXYZ = ivec3((hitPos - gmmConstant.voxelStartPos.xyz) / gmmConstant.voxelSize);
 	//uint voxelIndex = voxelIndexXYZ.z * gmmConstant.voxelNum.x * gmmConstant.voxelNum.y + voxelIndexXYZ.y * gmmConstant.voxelNum.x + voxelIndexXYZ.x;
 	//GMMPara gmmPara = gmmParas[voxelIndex];
-	GMMPara gmmPara = getGaussianPara_TrilinearInterpolation(hitPos);
+	 GMMPara gmmPara = getGaussianPara_TrilinearInterpolation(hitPos);
 	//GMMPara gmmPara = getGaussianPara_Jittering(hitPos, randomNumberSeed);
 	if(gmmPara.photonNum == 0){
 		pdf = 0.0f;
@@ -904,7 +904,7 @@ void photonTracing(Ray ray, inout uint randomNumberSeed, uint photonTracingIndex
 		mat3 axisTBN = createTBN(axisNormal);
 		photon.direction[i] = concentricMapping_hemisphere_3DTo2D(-ray.direction, axisTBN);
 	}
-	photon.weight = (0.299f * ray.radiance.x + 0.587f * ray.radiance.g + 0.114f * ray.radiance.b) * dot(ray.normal, ray.direction) * dot(-ray.direction, normal) / pdf;
+	photon.weight = (0.299f * ray.radiance.x + 0.587f * ray.radiance.g + 0.114f * ray.radiance.b) * dot(ray.normal, ray.direction) * dot(-ray.direction, normal);	// / pdf;
 	photonTracingResults[photonTracingIndex].photons[0] = photon;
 	photonTracingResults[photonTracingIndex].photonNum = 1;
 
@@ -925,7 +925,7 @@ void photonTracing(Ray ray, inout uint randomNumberSeed, uint photonTracingIndex
 	ray.normal = normal;
 	ray.depth = 100.0f;
 
-	int maxIterationNum = 9;	//一共是10
+	int maxIterationNum = 6;	//一共是10
 	while(maxIterationNum > 0){
 	
 		result = hitScene(ray);
@@ -944,7 +944,8 @@ void photonTracing(Ray ray, inout uint randomNumberSeed, uint photonTracingIndex
 		vec3 hitPos = ray.startPos + ray.depth * ray.direction;
 		getHitPointNormalAndTBN(vertexIndex, normal, TBN);
 
-		//hitTest(hitPos, normal);
+		//if(maxIterationNum == 5)
+		//	hitTest(hitPos, normal);
 
 		//计算光子强度的衰减fr项
 		ray.radiance *= getFr(hitPos, ray.startPos, ray.normal, lastHitPos, material);	//现在的材质还是上一个的
@@ -958,7 +959,7 @@ void photonTracing(Ray ray, inout uint randomNumberSeed, uint photonTracingIndex
 			mat3 axisTBN = createTBN(axisNormal);
 			photon.direction[i] = concentricMapping_hemisphere_3DTo2D(-ray.direction, axisTBN);
 		}
-		photon.weight = (0.299f * ray.radiance.x + 0.587f * ray.radiance.g + 0.114f * ray.radiance.b) * dot(-ray.direction, normal) / pdf / RR;
+		photon.weight = (0.299f * ray.radiance.x + 0.587f * ray.radiance.g + 0.114f * ray.radiance.b) * dot(-ray.direction, normal) / RR;	//pdf / RR;
 
 		uint photonNum = photonTracingResults[photonTracingIndex].photonNum;
 		photonTracingResults[photonTracingIndex].photons[photonNum] = photon;
@@ -974,7 +975,7 @@ void photonTracing(Ray ray, inout uint randomNumberSeed, uint photonTracingIndex
 		}
 
 		//获得出射方向
-		ray.radiance = ray.radiance * dot(-ray.direction, normal) / pdf / RR;	//需要打到下个顶点时才可以计算bxdf
+		ray.radiance = ray.radiance * dot(-ray.direction, normal) / RR;	//pdf / RR;	//需要打到下个顶点时才可以计算bxdf
 		lastHitPos = ray.startPos;
 		ray.startPos = hitPos;
 		ray.direction = getRayFromBxdf(material, TBN, -ray.direction, normal, randomNumberSeed, pdf);
@@ -1002,7 +1003,7 @@ void updateGMM(uint gmmIndex){
 			gmmPara.SSs[i] = SS;
 
 			GaussianPara gp;
-			gp.mixWeight = 0.0f;
+			gp.mixWeight = 0.1666f;
 			gp.mean = vec2(0.0f);		//每个轴（切线空间）一个高斯分布
 			gp.covarianceMatrix = mat2(1.0f);
 			gmmPara.gaussianParas[i] = gp;
@@ -1165,7 +1166,7 @@ vec3 sphereQuadSample(vec3 hitPos, float u, float v){
 
 }
 
-vec3 getRadianceFromLight(vec3 startPos, vec3 hitPos, vec3 normal, Material material){
+vec3 getRadianceFromLight(vec3 startPos, vec3 hitPos, vec3 normal, Material material, uint randomNumberSeed){
 
 	//return vec3(0.0f);
 
@@ -1188,66 +1189,28 @@ vec3 getRadianceFromLight(vec3 startPos, vec3 hitPos, vec3 normal, Material mate
 	vec3 F0 = vec3(0.04); 
 	F0 = mix(F0, albedo, metallic);
 
-	for(int k = 0; k < lightA; k++){
-	
-		vec2 uv = Hammersley(k, uint(lightA));
-		vec3 lightPointPos = sphereQuadSample(hitPos, uv.x, uv.y);
+	vec3 lightPointPos = lubo.lightPos.xyz + lubo.size.xyz * vec3(rand(randomNumberSeed), rand(randomNumberSeed), rand(randomNumberSeed));
 
-		vec3 i = normalize(lightPointPos - hitPos);
-		vec2 cosTheta = vec2(max(dot(-i, lightNormal), 0.0f), max(dot(i, normal), 0.0f));
-		float distance = max(length(lightPointPos - hitPos), 1.0f);
+	vec3 i = normalize(lightPointPos - hitPos);
+	vec2 cosTheta = vec2(max(dot(-i, lightNormal), 0.0f), max(dot(i, normal), 0.0f));
+	float distance = max(length(lightPointPos - hitPos), 1.0f);
 
-		float other = cosTheta.x * cosTheta.y / (distance * distance);
+	float other = cosTheta.x * cosTheta.y / (distance * distance);
 
-		vec3 h = normalize(i + o);
-		float NDF = DistributionGGX(normal, h, roughness);        
-		float G = GeometrySmith(normal, o, i, roughness);      
-		vec3 F = fresnelSchlick(max(dot(h, o), 0.0), F0); 
+	vec3 h = normalize(i + o);
+	float NDF = DistributionGGX(normal, h, roughness);        
+	float G = GeometrySmith(normal, o, i, roughness);      
+	vec3 F = fresnelSchlick(max(dot(h, o), 0.0), F0); 
 
-		vec3 nominator = NDF * G * F;
-		float denominator = 4.0 * max(dot(normal, o), 0.0) * max(dot(normal, i), 0.0) + 0.001; 
-		vec3 spec_fr = nominator / denominator;
+	vec3 nominator = NDF * G * F;
+	float denominator = 4.0 * max(dot(normal, o), 0.0) * max(dot(normal, i), 0.0) + 0.001; 
+	vec3 spec_fr = nominator / denominator;
 
-		vec3 ks = F;
-		vec3 kd = vec3(1.0) - ks;
-		kd *= (1.0 - metallic) * material.bxdfPara.x;  
+	vec3 ks = F;
+	vec3 kd = vec3(1.0) - ks;
+	kd *= (1.0 - metallic) * material.bxdfPara.x;  
 
-		radiance += (kd * albedo * diff_fr + spec_fr) * Li * other / pdf * getShadow(hitPos, lightPointPos);
-	
-	}
-
-/*
-	//将面光源分为kxk的小点光源
-	for(int i = 1; i < sqrtLightA * 2; i += 2){
-		vec3 lightPointPos = lightPos + vec3(lightSize.x, 0.0f, 0.0f) * i / (sqrtLightA * 2);
-		for(int j = 1; j < sqrtLightA * 2; j += 2){
-
-			lightPointPos = lightPos + vec3(0.0f, 0.0f, lightSize.z) * j / (sqrtLightA * 2);
-			
-			vec3 i = normalize(lightPointPos - hitPos);
-			vec2 cosTheta = vec2(max(dot(-i, lightNormal), 0.0f), max(dot(i, normal), 0.0f));
-			float distance = max(length(lightPointPos - hitPos), 1.0f);
-
-			float other = cosTheta.x * cosTheta.y / (distance * distance);
-
-			vec3 h = normalize(i + o);
-			float NDF = DistributionGGX(normal, h, roughness);        
-			float G = GeometrySmith(normal, o, i, roughness);      
-			vec3 F = fresnelSchlick(max(dot(h, o), 0.0), F0); 
-
-			vec3 nominator = NDF * G * F;
-			float denominator = 4.0 * max(dot(normal, o), 0.0) * max(dot(normal, i), 0.0) + 0.001; 
-			vec3 spec_fr = nominator / denominator;
-
-			vec3 ks = F;
-			vec3 kd = vec3(1.0) - ks;
-			kd *= (1.0 - metallic) * material.bxdfPara.x;  
-
-			radiance += (kd * albedo * diff_fr + spec_fr) * Li * other / pdf * getShadow(hitPos, lightPointPos);
-
-		}
-	}
-*/
+	radiance += (kd * albedo * diff_fr + spec_fr) * Li * other / pdf;	// * getShadow(hitPos, lightPointPos);
 
 	return radiance / float(lightA);
 
@@ -1289,7 +1252,7 @@ vec3 pathTracing(Ray ray, uint randomNumberSeed, int type, inout float pdfSum){
 	getHitPointNormalAndTBN(vertexIndex, normal, TBN);	//计算面法线
 	material = meshs[meshIndex].material;
 
-	vec3 lightRadiance = vec3(0);	//getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
+	vec3 lightRadiance = getRadianceFromLight(ray.startPos, hitPos, normal, material, randomNumberSeed);	//发过来的radiance
 	vec3 hitPointEmission = getRadianceFromHitPoint(material, ray.startPos, hitPos, normal);
 	vec3 irradiance = lightRadiance + hitPointEmission;
 	radiance += irradiance;		//weight = 1
@@ -1355,7 +1318,7 @@ vec3 pathTracing(Ray ray, uint randomNumberSeed, int type, inout float pdfSum){
 			return radiance;
 		}
 
-		pdfSum *= pdf;
+		pdfSum += pdf;
 
 		meshIndex = result.x;
 		vertexIndex = result.y;
@@ -1364,7 +1327,7 @@ vec3 pathTracing(Ray ray, uint randomNumberSeed, int type, inout float pdfSum){
 		lastMaterial = material;
 		material = meshs[meshIndex].material;
 
-		vec3 lightRadiance = vec3(0);	//getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
+		vec3 lightRadiance = getRadianceFromLight(ray.startPos, hitPos, normal, material, randomNumberSeed);	//发过来的radiance
 		vec3 hitPointEmission = getRadianceFromHitPoint(material, ray.startPos, hitPos, normal);
 		vec3 irradiance = lightRadiance + hitPointEmission;
 		weight *= getFr(lastHitPos, ray.startPos, ray.normal, hitPos, lastMaterial) * max(dot(ray.direction, ray.normal), 0.0f) / pdf / RR;
@@ -1418,6 +1381,7 @@ void main(){
 	//不能直接用gl_GlobalInvocationID，因为我要尽量让一个worlGroup进行工作，现在相当于按组排序
 	uint threadIndex = workGroupIndex * workGroupSize + uint(gl_LocalInvocationIndex);
 	
+	imageStore(pathTracingResult, ivec2(gl_GlobalInvocationID.xy), vec4(vec3(0.0f), 1.0f));
 	if(threadIndex < gmmConstant.photonTracingNum){
 		float pdf;
 		ray = makeStartPhoton(seed, pdf);
@@ -1438,7 +1402,7 @@ void main(){
 
 	vec3 radiance = vec3(0.0f);
 	vec2 texelSize = 1.0f / (gl_WorkGroupSize * gl_NumWorkGroups).xy;
-	int sppNum = 1;
+	int sppNum = 10;
 	for(int i = 0; i < sppNum; i++){
 
 		vec2 texelUV = (vec2(gl_GlobalInvocationID.xy) + vec2(rand(seed), rand(seed))) * texelSize;
@@ -1450,14 +1414,14 @@ void main(){
 		float pdfPhotonGuiding = 0.0f;
 		vec3 photonGuidingRadiance = pathTracing(ray, seed, 1, pdfPhotonGuiding);
 
-		//float pdfSum = max(pdfBxDF * pdfBxDF + pdfPhotonGuiding * pdfPhotonGuiding, 0.0001f);
-		//radiance += max(bxdfRadiance * (pdfBxDF * pdfBxDF / pdfSum) + photonGuidingRadiance * (pdfPhotonGuiding * pdfPhotonGuiding / pdfSum), 0.0f);
+		float pdfSum = max(pdfBxDF * pdfBxDF + pdfPhotonGuiding * pdfPhotonGuiding, 0.0001f);
+		radiance += max(bxdfRadiance * (pdfBxDF * pdfBxDF / pdfSum) + photonGuidingRadiance * (pdfPhotonGuiding * pdfPhotonGuiding / pdfSum), 0.0f);
 		//radiance += bxdfRadiance * 0.5f + photonGuidingRadiance * 0.5f;
-		radiance += photonGuidingRadiance;
+		//radiance += photonGuidingRadiance;
 
 	}
 
 	radiance /= sppNum;
-	imageStore(pathTracingResult, ivec2(gl_GlobalInvocationID.xy), vec4(radiance, 1.0f));
+	imageStore(pathTracingResult, ivec2(gl_GlobalInvocationID.xy), vec4(radiance * 10.0f, 1.0f));
 
 }
