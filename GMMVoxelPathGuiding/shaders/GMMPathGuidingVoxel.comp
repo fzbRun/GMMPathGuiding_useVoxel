@@ -451,7 +451,7 @@ mat2 Cholesky(mat2 covMatrix){
 	return L;
 }
 
-vec2 sample2DGussian(GaussianPara gp, inout uint randomNumberSeed, inout float pdf){
+vec2 sample2DGussian(GaussianPara gp, inout uint randomNumberSeed){
 
 	mat2 covMatrix = gp.covarianceMatrix;
 	vec2 mean = gp.mean;
@@ -464,7 +464,6 @@ vec2 sample2DGussian(GaussianPara gp, inout uint randomNumberSeed, inout float p
 	float Y = sqrt(-2.0f * log(randomNumber.x)) * sin(2.0f * PI * randomNumber.y);
 
 	vec2 direction = mean + L * vec2(X, Y);
-	pdf = clamp(GaussianPdf(gp, direction), 0.01f, 1.0f);
 	return direction;
 
 }
@@ -574,6 +573,7 @@ GMMPara getGaussianPara_Jittering(vec3 hitPos, uint randomNumberSeed){
 vec3 getRayFromPhotonGuide(vec3 hitPos, mat3 TBN, uint randomNumberSeed, inout float pdf){
 
 	vec3 normal = TBN[2];
+	pdf = 0.0f;
 
 	//ivec3 voxelIndexXYZ = ivec3((hitPos - gmmConstant.voxelStartPos.xyz) / gmmConstant.voxelSize);
 	//uint voxelIndex = voxelIndexXYZ.z * gmmConstant.voxelNum.x * gmmConstant.voxelNum.y + voxelIndexXYZ.y * gmmConstant.voxelNum.x + voxelIndexXYZ.x;
@@ -581,7 +581,6 @@ vec3 getRayFromPhotonGuide(vec3 hitPos, mat3 TBN, uint randomNumberSeed, inout f
 	 GMMPara gmmPara = getGaussianPara_TrilinearInterpolation(hitPos);
 	//GMMPara gmmPara = getGaussianPara_Jittering(hitPos, randomNumberSeed);
 	if(gmmPara.photonNum == 0){
-		pdf = 0.0f;
 		return vec3(0.0f);
 	}
 
@@ -600,12 +599,13 @@ vec3 getRayFromPhotonGuide(vec3 hitPos, mat3 TBN, uint randomNumberSeed, inout f
 	}
 
 	if(mixWeightSum == 0.0f){
-		pdf = 0.0f;
 		return vec3(0.0f);
 	}
 
 	float probability = 0.0f;
 	float randomNumber = rand(randomNumberSeed);
+	vec3 sampleDirection = vec3(0.0f);
+	vec2 sampleDirection_2D = vec2(0.0f);
 	for(int i = 0; i < K; i++){
 		if(gussian[i] == 0.0f){
 			continue;
@@ -613,13 +613,21 @@ vec3 getRayFromPhotonGuide(vec3 hitPos, mat3 TBN, uint randomNumberSeed, inout f
 		probability += gmmPara.gaussianParas[i].mixWeight / mixWeightSum;
 		if(randomNumber < probability){
 			mat3 axisTBN = createTBN(axisNormals[i]);
-			vec3 sampelDirection = concentricMapping_hemisphere_2DTo3D(sample2DGussian(gmmPara.gaussianParas[i], randomNumberSeed, pdf), axisTBN);
-			return sampelDirection;
+			sampleDirection_2D = sample2DGussian(gmmPara.gaussianParas[i], randomNumberSeed);
+			sampleDirection = concentricMapping_hemisphere_2DTo3D(sampleDirection_2D, axisTBN);
+			pdf = clamp(GaussianPdf(gmmPara.gaussianParas[i], sampleDirection_2D), 0.01f, 1.0f);
+			break;
 		}
 	}
+	//for(int i = 0; i < K; i++){
+	//	if(gussian[i] == 0.0f){
+	//		continue;
+	//	}
+	//	pdf += clamp(GaussianPdf(gmmPara.gaussianParas[i], sampleDirection_2D), 0.01f, 1.0f) * gmmPara.gaussianParas[i].mixWeight / mixWeightSum;
+	//}
+	//pdf = clamp(pdf, 0.01f, 1.0f);
 
-	pdf = 0.0f;
-	return vec3(0.0f);
+	return sampleDirection;
 
 	
 }
